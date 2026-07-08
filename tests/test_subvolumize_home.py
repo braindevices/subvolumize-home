@@ -199,7 +199,7 @@ def test_cmd_convert_converts_absolute_paths_entry_within_extra_root(tmp_path, m
     (extra / "file.txt").write_text("data")
 
     monkeypatch.setattr(svh.Path, "home", lambda: home)
-    monkeypatch.setattr(svh, "require_tool", lambda name: None)
+    monkeypatch.setattr(svh, "require_tool", lambda *a, **kw: None)
     monkeypatch.setattr(svh, "get_fstype", lambda path: "btrfs")
     monkeypatch.setattr(svh, "is_subvolume", lambda path: False)
     monkeypatch.setattr(svh, "copy_contents", lambda src, dst: None)
@@ -233,7 +233,7 @@ def test_cmd_convert_extra_roots_alone_is_never_a_target(tmp_path, monkeypatch, 
     (extra / "file.txt").write_text("data")
 
     monkeypatch.setattr(svh.Path, "home", lambda: home)
-    monkeypatch.setattr(svh, "require_tool", lambda name: None)
+    monkeypatch.setattr(svh, "require_tool", lambda *a, **kw: None)
     monkeypatch.setattr(svh, "get_fstype", lambda path: "btrfs")
     monkeypatch.setattr(svh, "is_subvolume", lambda path: False)
     monkeypatch.setattr(svh, "copy_contents", lambda src, dst: None)
@@ -262,7 +262,7 @@ def test_cmd_convert_skips_target_outside_home_and_extra_roots(tmp_path, monkeyp
     home.mkdir()
 
     monkeypatch.setattr(svh.Path, "home", lambda: home)
-    monkeypatch.setattr(svh, "require_tool", lambda name: None)
+    monkeypatch.setattr(svh, "require_tool", lambda *a, **kw: None)
     monkeypatch.setattr(svh, "get_fstype", lambda path: "btrfs")
     monkeypatch.setattr(svh, "is_subvolume", lambda path: False)
 
@@ -295,7 +295,7 @@ def test_cmd_convert_skips_absolute_paths_entry_not_covered_by_extra_roots(
     uncovered.mkdir()
 
     monkeypatch.setattr(svh.Path, "home", lambda: home)
-    monkeypatch.setattr(svh, "require_tool", lambda name: None)
+    monkeypatch.setattr(svh, "require_tool", lambda *a, **kw: None)
     monkeypatch.setattr(svh, "get_fstype", lambda path: "btrfs")
     monkeypatch.setattr(svh, "is_subvolume", lambda path: False)
 
@@ -325,7 +325,7 @@ def test_cmd_convert_sys_paths_bypasses_scope_check(tmp_path, monkeypatch, fake_
     (outside / "file.txt").write_text("data")
 
     monkeypatch.setattr(svh.Path, "home", lambda: home)
-    monkeypatch.setattr(svh, "require_tool", lambda name: None)
+    monkeypatch.setattr(svh, "require_tool", lambda *a, **kw: None)
     monkeypatch.setattr(svh, "get_fstype", lambda path: "btrfs")
     monkeypatch.setattr(svh, "is_subvolume", lambda path: False)
     monkeypatch.setattr(svh, "copy_contents", lambda src, dst: None)
@@ -359,7 +359,7 @@ def test_cmd_convert_uniform_non_btrfs_skip_does_not_fail_run(tmp_path, monkeypa
     bad.mkdir()
 
     monkeypatch.setattr(svh.Path, "home", lambda: home)
-    monkeypatch.setattr(svh, "require_tool", lambda name: None)
+    monkeypatch.setattr(svh, "require_tool", lambda *a, **kw: None)
     fstypes = {str(bad): "ext4"}
     monkeypatch.setattr(svh, "get_fstype", lambda path: fstypes.get(str(path), "btrfs"))
     monkeypatch.setattr(svh, "is_subvolume", lambda path: False)
@@ -400,7 +400,7 @@ def test_cmd_convert_follows_symlink_into_allowed_extra_root(tmp_path, monkeypat
     symlink.symlink_to(caches_dir)
 
     monkeypatch.setattr(svh.Path, "home", lambda: home)
-    monkeypatch.setattr(svh, "require_tool", lambda name: None)
+    monkeypatch.setattr(svh, "require_tool", lambda *a, **kw: None)
     monkeypatch.setattr(svh, "get_fstype", lambda path: "btrfs")
     monkeypatch.setattr(svh, "is_subvolume", lambda path: False)
     monkeypatch.setattr(svh, "copy_contents", lambda src, dst: None)
@@ -425,6 +425,109 @@ def test_cmd_convert_follows_symlink_into_allowed_extra_root(tmp_path, monkeypat
     assert not any(
         c[:3] == ["btrfs", "subvolume", "create"] and c[3] == str(extra_root_dir) for c in fake_btrfs_create
     )
+
+
+def test_require_tool_missing_binary_exits(monkeypatch):
+    monkeypatch.setattr(svh.shutil, "which", lambda name: None)
+    with pytest.raises(SystemExit, match="not found in PATH"):
+        svh.require_tool("cp")
+
+
+def test_require_tool_no_feature_check_passes_on_presence(monkeypatch):
+    monkeypatch.setattr(svh.shutil, "which", lambda name: "/usr/bin/cp")
+
+    def fail_run(cmd, **kwargs):
+        raise AssertionError("run() should not be called when no feature is requested")
+
+    monkeypatch.setattr(svh, "run", fail_run)
+    svh.require_tool("cp")  # should not raise
+
+
+def test_require_tool_feature_present_passes(monkeypatch):
+    monkeypatch.setattr(svh.shutil, "which", lambda name: "/usr/bin/cp")
+    monkeypatch.setattr(
+        svh, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout="--reflink[=WHEN]", stderr="")
+    )
+    svh.require_tool("cp", feature="--reflink")  # should not raise
+
+
+def test_require_tool_feature_missing_exits(monkeypatch):
+    """e.g. a busybox/toybox `cp`, or coreutils < 8.5: present on PATH,
+    but doesn't understand --reflink at all."""
+    monkeypatch.setattr(svh.shutil, "which", lambda name: "/usr/bin/cp")
+    monkeypatch.setattr(svh, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout="usage: cp SRC DST", stderr=""))
+    with pytest.raises(SystemExit, match="does not support"):
+        svh.require_tool("cp", feature="--reflink")
+
+
+def test_require_tool_feature_checked_via_custom_flag(monkeypatch):
+    monkeypatch.setattr(svh.shutil, "which", lambda name: "/usr/bin/foo")
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(svh, "run", fake_run)
+    with pytest.raises(SystemExit):
+        svh.require_tool("foo", feature="bar", feature_flag="--version")
+    assert seen["cmd"] == ["foo", "--version"]
+
+
+def test_unescape_proc_mounts_field_octal_space():
+    assert svh._unescape_proc_mounts_field(r"/mnt/my\040drive") == "/mnt/my drive"
+
+
+def test_unescape_proc_mounts_field_plain_passthrough():
+    assert svh._unescape_proc_mounts_field("/home") == "/home"
+
+
+def test_get_fstype_from_proc_mounts_picks_most_specific_match(tmp_path, monkeypatch):
+    fake_mounts = tmp_path / "mounts"
+    fake_mounts.write_text(
+        "dev1 / btrfs rw 0 0\n"
+        "dev2 /home btrfs rw 0 0\n"
+        "dev3 /home/alice/data xfs rw 0 0\n"
+    )
+    monkeypatch.setattr(svh, "PROC_MOUNTS_PATH", fake_mounts)
+
+    assert svh.get_fstype_from_proc_mounts(Path("/home/alice/data/whatever")) == "xfs"
+    assert svh.get_fstype_from_proc_mounts(Path("/home/alice/other")) == "btrfs"
+    assert svh.get_fstype_from_proc_mounts(Path("/etc")) == "btrfs"
+
+
+def test_get_fstype_from_proc_mounts_unreadable_returns_none(tmp_path, monkeypatch):
+    monkeypatch.setattr(svh, "PROC_MOUNTS_PATH", tmp_path / "does-not-exist")
+    assert svh.get_fstype_from_proc_mounts(Path("/anything")) is None
+
+
+def test_get_fstype_prefers_findmnt_when_usable(monkeypatch):
+    monkeypatch.setattr(svh.shutil, "which", lambda name: "/usr/bin/findmnt")
+    monkeypatch.setattr(svh, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout="btrfs\n", stderr=""))
+    monkeypatch.setattr(svh, "get_fstype_from_proc_mounts", lambda path: (_ for _ in ()).throw(
+        AssertionError("fallback should not be used when findmnt succeeds")
+    ))
+    assert svh.get_fstype(Path("/whatever")) == "btrfs"
+
+
+def test_get_fstype_falls_back_when_findmnt_not_on_path(monkeypatch):
+    monkeypatch.setattr(svh.shutil, "which", lambda name: None)
+    monkeypatch.setattr(svh, "get_fstype_from_proc_mounts", lambda path: "ext4")
+    assert svh.get_fstype(Path("/whatever")) == "ext4"
+
+
+def test_get_fstype_falls_back_when_findmnt_invocation_fails(monkeypatch):
+    monkeypatch.setattr(svh.shutil, "which", lambda name: "/usr/bin/findmnt")
+    monkeypatch.setattr(svh, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, stdout="", stderr="boom"))
+    monkeypatch.setattr(svh, "get_fstype_from_proc_mounts", lambda path: "xfs")
+    assert svh.get_fstype(Path("/whatever")) == "xfs"
+
+
+def test_get_fstype_exits_when_nothing_works(monkeypatch):
+    monkeypatch.setattr(svh.shutil, "which", lambda name: None)
+    monkeypatch.setattr(svh, "get_fstype_from_proc_mounts", lambda path: None)
+    with pytest.raises(SystemExit, match="could not determine filesystem type"):
+        svh.get_fstype(Path("/whatever"))
 
 
 def test_is_subvolume_uses_inode_256(tmp_path):
@@ -1012,6 +1115,7 @@ def test_config_list_includes_extra_roots_section(tmp_path, capsys):
 
 def test_install_per_user_copies_self(tmp_path, monkeypatch):
     monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(svh, "require_tool", lambda *a, **kw: None)
     args = SimpleNamespace(global_install=False, service=False)
 
     svh.cmd_install(args)
@@ -1033,6 +1137,7 @@ def test_install_global_requires_root(monkeypatch):
 def test_install_service_requires_systemctl(tmp_path, monkeypatch):
     monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
     monkeypatch.setattr(svh.shutil, "which", lambda name: None if name == "systemctl" else "/usr/bin/true")
+    monkeypatch.setattr(svh, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout="--reflink", stderr=""))
     copy_calls = []
     monkeypatch.setattr(svh.shutil, "copy2", lambda src, dst: copy_calls.append((src, dst)))
     args = SimpleNamespace(global_install=False, service=True)
@@ -1046,6 +1151,7 @@ def test_install_service_requires_systemctl(tmp_path, monkeypatch):
 def test_install_without_service_does_not_require_systemctl(tmp_path, monkeypatch):
     monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
     monkeypatch.setattr(svh.shutil, "which", lambda name: None if name == "systemctl" else "/usr/bin/true")
+    monkeypatch.setattr(svh, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout="--reflink", stderr=""))
     args = SimpleNamespace(global_install=False, service=False)
 
     svh.cmd_install(args)  # should not raise
@@ -1059,6 +1165,8 @@ def test_install_per_user_service_writes_correct_unit(tmp_path, monkeypatch):
 
     def fake_run(cmd, **kwargs):
         calls.append(cmd)
+        if cmd[:2] == ["cp", "--help"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="--reflink", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     monkeypatch.setattr(svh, "run", fake_run)
@@ -1087,6 +1195,8 @@ def test_install_global_service_uses_absolute_exec_path(monkeypatch):
 
     def fake_run(cmd, **kwargs):
         calls.append(cmd)
+        if cmd[:2] == ["cp", "--help"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="--reflink", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     def fake_write_text(self, content, *a, **kw):

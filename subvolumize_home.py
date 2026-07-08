@@ -60,6 +60,7 @@ import argparse
 import glob as globmod
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -513,17 +514,100 @@ def run(cmd, **kwargs):
     return subprocess.run(cmd, **kwargs)
 
 
-def require_tool(name):
+def require_tool(name: str, feature: Optional[str] = None, feature_flag: str = "--help") -> None:
+    """
+    Exit if `name` isn't on PATH at all -- or, when `feature` is given,
+    if running `name feature_flag` doesn't mention `feature` anywhere in
+    its output.
+
+    The feature check matters for tools where merely existing on PATH
+    isn't enough: e.g. `cp` on a minimal system might be busybox/toybox,
+    or a coreutils older than 8.5, neither of which understands
+    --reflink at all. Without this check, that would only surface the
+    first time copy_contents() actually runs -- mid-conversion, after
+    the target has already been renamed aside (still safely rolled
+    back, but a much later and more confusing failure than catching it
+    up front).
+    """
     if shutil.which(name) is None:
         sys.exit(f"error: required tool '{name}' not found in PATH")
+    if feature is None:
+        return
+    result = run([name, feature_flag])
+    output = (result.stdout or "") + (result.stderr or "")
+    if feature not in output:
+        sys.exit(
+            f"error: '{name}' on PATH does not support '{feature}' "
+            f"(checked via `{name} {feature_flag}`) -- is this GNU coreutils?"
+        )
+
+
+_PROC_MOUNTS_ESCAPE_RE = re.compile(r"\\([0-7]{3})")
+
+PROC_MOUNTS_PATH = Path("/proc/mounts")
+
+
+def _unescape_proc_mounts_field(field: str) -> str:
+    """/proc/mounts encodes space/tab/newline/backslash in paths as
+    octal escapes (e.g. "\\040" for a space); undo that."""
+    return _PROC_MOUNTS_ESCAPE_RE.sub(lambda m: chr(int(m.group(1), 8)), field)
+
+
+def get_fstype_from_proc_mounts(path: Path) -> Optional[str]:
+    """
+    Pure-stdlib fallback for get_fstype(): scans /proc/mounts and picks
+    the mount entry whose mountpoint is the longest matching prefix of
+    `path` -- the same "most specific mount wins" rule the kernel
+    itself uses (e.g. a separate /home mount takes precedence over / for
+    a path under /home). Returns None if /proc/mounts can't be read, or
+    (shouldn't happen for a real path -- / is always mounted) nothing
+    matches.
+    """
+    try:
+        lines = PROC_MOUNTS_PATH.read_text().splitlines()
+    except OSError:
+        return None
+
+    target = path.resolve()
+    best_fstype = None
+    best_depth = -1
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 3:
+            continue
+        mountpoint = Path(_unescape_proc_mounts_field(fields[1]))
+        if target != mountpoint and mountpoint not in target.parents:
+            continue
+        depth = len(mountpoint.parts)
+        if depth > best_depth:
+            best_depth = depth
+            best_fstype = fields[2]
+    return best_fstype
 
 
 def get_fstype(path: Path) -> str:
-    """Return the filesystem type that `path` lives on, via findmnt."""
-    result = run(["findmnt", "-n", "-o", "FSTYPE", "--target", str(path)])
-    if result.returncode != 0:
-        sys.exit(f"error: could not determine filesystem type for {path}: {result.stderr.strip()}")
-    return result.stdout.strip()
+    """
+    Return the filesystem type that `path` lives on.
+
+    Prefers `findmnt` when it's on PATH and its invocation succeeds --
+    it walks the kernel's own mount table, handling bind mounts and
+    other edge cases. Falls back to parsing /proc/mounts directly
+    (pure stdlib, no external tool) if findmnt isn't usable for any
+    reason, so this still works on a minimal system that has
+    btrfs-progs but not util-linux's findmnt -- notably the
+    raw-script-download usage path in the README, which never goes
+    through cmd_install's preflight tool checks.
+    """
+    if shutil.which("findmnt"):
+        result = run(["findmnt", "-n", "-o", "FSTYPE", "--target", str(path)])
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+
+    fstype = get_fstype_from_proc_mounts(path)
+    if fstype is None:
+        sys.exit(f"error: could not determine filesystem type for {path} "
+                  f"(findmnt unavailable or failed, and /proc/mounts had no matching entry)")
+    return fstype
 
 
 def is_btrfs(path: Path) -> bool:
@@ -673,11 +757,20 @@ def cmd_install(args) -> None:
     """Install this script (and optionally its systemd --user unit) so it
     runs automatically at login -- either for the current user only, or
     system-wide for every user (present and future) via --global."""
+    # Fail before touching the filesystem: an install onto a machine
+    # that's missing what cmd_convert actually needs at run time is
+    # useless (or, for --service, silently broken on every future
+    # login), so check everything up front rather than let it surface
+    # confusingly later. This is a stricter check than cmd_convert's own
+    # findmnt requirement (get_fstype() has a pure-stdlib fallback for
+    # findmnt specifically, for resilience against it going missing
+    # later, or the raw-script-download usage path that never runs
+    # `install` at all) -- an install is meant to set up the fully
+    # supported experience, not just the bare minimum to limp along.
+    require_tool("findmnt")
+    require_tool("btrfs")
+    require_tool("cp", feature="--reflink")
     if args.service:
-        # Fail before touching the filesystem: without this, a missing
-        # systemctl would only surface after the binary was already
-        # copied into place and the unit file already written, leaving
-        # a partial, confusing install.
         require_tool("systemctl")
 
     self_path = Path(__file__).resolve()
@@ -819,9 +912,12 @@ def cmd_convert(args) -> None:
 
     sys_path_entries = args.sys_paths or []
 
-    require_tool("findmnt")
+    # findmnt is deliberately not required here: get_fstype() falls back
+    # to parsing /proc/mounts directly if findmnt isn't usable, so this
+    # still works without it (e.g. the raw-script-download usage path
+    # that never runs `install`'s stricter preflight checks).
     require_tool("btrfs")
-    require_tool("cp")
+    require_tool("cp", feature="--reflink")
 
     home = Path.home().resolve()
 
