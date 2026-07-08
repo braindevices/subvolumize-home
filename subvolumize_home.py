@@ -18,15 +18,21 @@ Safety model
 3. Conversion never deletes data blindly:
      - existing dir is renamed to a sibling backup dir (instant, same fs)
      - a new empty subvolume is created in its place
-     - contents are copied back in with rsync -aHAX (falls back to
-       shutil.copytree if rsync isn't installed)
+     - contents are copied back in via `cp -a --reflink=always` (src and
+       dst are always on the same btrfs filesystem by this point, so
+       this is a near-instant, space-free reflink copy, not a real one)
      - original ownership/mode is restored on the new subvolume root
      - the backup dir is only removed after the copy succeeds
      - on any failure, the subvolume is destroyed and the backup is
        renamed back into place, so you never end up worse off
-4. Dry-run by default in the sense that every change is printed; use
+4. A target that doesn't exist yet is skipped, never auto-created:
+   creating a fresh subvolume for a path with a missing ancestor (e.g.
+   an external drive that isn't currently mounted) would otherwise
+   silently land it on whatever filesystem the nearest *existing*
+   ancestor happens to sit on -- often not the one you meant.
+5. Dry-run by default in the sense that every change is printed; use
    --yes to skip the interactive per-path confirmation.
-5. `paths` entries (default list, config, --paths) are usually relative
+6. `paths` entries (default list, config, --paths) are usually relative
    to $HOME, but may also be absolute + contain a $USER placeholder --
    in which case they must resolve within a configured `extra_roots`
    boundary (config key or --extra-roots) to be allowed. `extra_roots`
@@ -546,22 +552,27 @@ def path_on_same_filesystem(a: Path, b: Path) -> bool:
 
 
 def copy_contents(src: Path, dst: Path):
-    """Copy everything *inside* src into dst (dst already exists, empty)."""
-    if shutil.which("rsync"):
-        result = run(
-            ["rsync", "-aHAX", "--", f"{src}/", f"{dst}/"],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"rsync failed: {result.stderr.strip()}")
-    else:
-        for item in src.iterdir():
-            target = dst / item.name
-            if item.is_symlink() or item.is_file():
-                shutil.copy2(item, target, follow_symlinks=False)
-            elif item.is_dir():
-                shutil.copytree(item, target, symlinks=True)
+    """
+    Copy everything *inside* src into dst (dst already exists, empty),
+    via reflink rather than a real data copy.
+
+    src (the renamed-aside backup) and dst (the freshly created
+    subvolume) are always on the same btrfs filesystem by the time this
+    runs (see convert_path/cmd_convert's checks), so a reflink copy is
+    always possible: near-instant regardless of data size, and shares
+    the underlying extents with the backup rather than doubling disk
+    usage -- which matters a lot for multi-GB cache directories.
+    --reflink=always (not =auto) is deliberate: if reflink somehow isn't
+    possible, fail loudly and roll back rather than silently falling
+    back to a full copy that would defeat the entire point.
+
+    -T/--no-target-directory makes cp treat dst as the literal target to
+    populate (merging src's contents into it), instead of nesting src a
+    level deeper inside dst the way a bare `cp -a src dst` would.
+    """
+    result = run(["cp", "-a", "--reflink=always", "-T", "--", str(src), str(dst)])
+    if result.returncode != 0:
+        raise RuntimeError(f"cp --reflink=always failed: {result.stderr.strip()}")
 
 
 def convert_path(path: Path, dry_run: bool) -> bool:
@@ -569,14 +580,14 @@ def convert_path(path: Path, dry_run: bool) -> bool:
     label = str(path)
 
     if not path.exists():
-        print(f"[create] {label} does not exist yet -> will create as an empty subvolume")
-        if dry_run:
-            return True
-        result = run(["btrfs", "subvolume", "create", str(path)])
-        if result.returncode != 0:
-            print(f"  ERROR creating subvolume: {result.stderr.strip()}")
-            return False
-        print(f"  created empty subvolume at {label}")
+        # Deliberately a skip, not an auto-create: if some ancestor in
+        # `path` doesn't exist either -- e.g. the whole target lives on
+        # an external drive that isn't currently mounted -- a
+        # "create if missing" policy would silently create a fresh
+        # subvolume on whatever filesystem the nearest existing
+        # ancestor actually sits on (often the root filesystem under an
+        # unmounted mountpoint), not the one the user actually intended.
+        print(f"[skip]   {label} does not exist, leaving alone")
         return True
 
     if path.is_symlink():
@@ -810,6 +821,7 @@ def cmd_convert(args) -> None:
 
     require_tool("findmnt")
     require_tool("btrfs")
+    require_tool("cp")
 
     home = Path.home().resolve()
 

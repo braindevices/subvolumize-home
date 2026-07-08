@@ -13,6 +13,7 @@ behavior of btrfs itself.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -34,7 +35,6 @@ def fake_btrfs_create(monkeypatch):
             target.mkdir(parents=True, exist_ok=False)
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         if cmd[:3] == ["btrfs", "subvolume", "delete"]:
-            import shutil
             shutil.rmtree(cmd[3], ignore_errors=True)
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         raise AssertionError(f"unexpected command: {cmd}")
@@ -56,6 +56,13 @@ def test_convert_path_first_time_migration(tmp_path, monkeypatch):
         if cmd[:3] == ["btrfs", "subvolume", "create"]:
             Path(cmd[3]).mkdir(parents=True, exist_ok=False)
             converted["done"] = True
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[0] == "cp":
+            # simulate the reflink copy: real reflinks aren't guaranteed
+            # available on the test tmpfs, so just copy the content --
+            # the assertions below only care that it ends up in place.
+            src, dst = cmd[-2], cmd[-1]
+            shutil.copytree(src, dst, dirs_exist_ok=True)
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         raise AssertionError(f"unexpected command: {cmd}")
 
@@ -107,25 +114,23 @@ def test_convert_path_skips_symlink(tmp_path, monkeypatch):
     assert link.is_symlink()
 
 
-def test_convert_path_creates_missing_path_as_subvolume(tmp_path, monkeypatch):
+def test_convert_path_skips_missing_target(tmp_path, monkeypatch):
+    """A target that doesn't exist yet is skipped, not auto-created as an
+    empty subvolume -- see convert_path's docstring for why (a missing
+    ancestor, e.g. an unmounted drive, would otherwise get a fresh
+    subvolume silently created on the wrong filesystem)."""
     target = tmp_path / "not_yet_created"
     monkeypatch.setattr(svh, "is_subvolume", lambda path: False)
 
-    created = {}
+    def fail_run(cmd, **kwargs):
+        raise AssertionError("run() should not be called for a missing target")
 
-    def fake_run(cmd, **kwargs):
-        assert cmd == ["btrfs", "subvolume", "create", str(target)]
-        target.mkdir()
-        created["called"] = True
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(svh, "run", fake_run)
+    monkeypatch.setattr(svh, "run", fail_run)
 
     ok = svh.convert_path(target, dry_run=False)
 
     assert ok is True
-    assert created.get("called") is True
-    assert target.is_dir()
+    assert not target.exists()
 
 
 def test_convert_path_dry_run_does_not_touch_filesystem(tmp_path, monkeypatch):
@@ -347,6 +352,9 @@ def test_cmd_convert_uniform_non_btrfs_skip_does_not_fail_run(tmp_path, monkeypa
     monkeypatch.setattr(svh, "DEFAULT_VOLATILE_PATHS", [])
     home = tmp_path / "alice"
     home.mkdir()
+    good = home / "gooddir"
+    good.mkdir()
+    (good / "file.txt").write_text("data")
     bad = tmp_path / "not-btrfs-drive"
     bad.mkdir()
 
@@ -370,7 +378,7 @@ def test_cmd_convert_uniform_non_btrfs_skip_does_not_fail_run(tmp_path, monkeypa
 
     out = capsys.readouterr().out
     assert "not btrfs" in out
-    assert ["btrfs", "subvolume", "create", str(home / "gooddir")] in fake_btrfs_create
+    assert ["btrfs", "subvolume", "create", str(good)] in fake_btrfs_create
     assert not any(
         c[:3] == ["btrfs", "subvolume", "create"] and c[3] == str(bad) for c in fake_btrfs_create
     )

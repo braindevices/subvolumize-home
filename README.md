@@ -54,7 +54,8 @@ uv tool install subvolumize-home
 
 No dependencies beyond the Python standard library, no version
 requirement beyond Python 3.8+. `subvolumize-home` additionally needs
-Linux with `btrfs-progs` and `findmnt` installed.
+Linux with `btrfs-progs`, `findmnt`, and a `cp` supporting
+`--reflink` (GNU coreutils >= 8.5, i.e. virtually any current distro).
 
 ## Command shape
 
