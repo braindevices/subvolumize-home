@@ -182,6 +182,243 @@ def test_convert_path_rollback_on_copy_failure(tmp_path, monkeypatch):
     assert not (target.parent / "cache.pre-subvol.bak").exists()
 
 
+def test_cmd_convert_converts_absolute_paths_entry_within_extra_root(tmp_path, monkeypatch, fake_btrfs_create):
+    """An absolute `paths` entry ($USER-validated) is converted directly
+    as long as it resolves within a configured extra_roots boundary."""
+    monkeypatch.setattr(svh, "DEFAULT_VOLATILE_PATHS", [])
+    home = tmp_path / "alice"
+    home.mkdir()
+    extra = tmp_path / "data" / "alice" / "caches"
+    extra.parent.mkdir(parents=True)
+    extra.mkdir()
+    (extra / "file.txt").write_text("data")
+
+    monkeypatch.setattr(svh.Path, "home", lambda: home)
+    monkeypatch.setattr(svh, "require_tool", lambda name: None)
+    monkeypatch.setattr(svh, "get_fstype", lambda path: "btrfs")
+    monkeypatch.setattr(svh, "is_subvolume", lambda path: False)
+    monkeypatch.setattr(svh, "copy_contents", lambda src, dst: None)
+
+    args = SimpleNamespace(
+        paths=[f"{tmp_path}/data/$USER/caches"],
+        extra_roots=[f"{tmp_path}/data/$USER"],
+        sys_paths=None,
+        config=tmp_path / "no-such-config.json",
+        dry_run=False,
+        yes=True,
+    )
+
+    svh.cmd_convert(args)
+
+    assert ["btrfs", "subvolume", "create", str(extra)] in fake_btrfs_create
+
+
+def test_cmd_convert_extra_roots_alone_is_never_a_target(tmp_path, monkeypatch, fake_btrfs_create):
+    """extra_roots is a pure trust boundary -- listing a path there does
+    NOT, by itself, convert it (regression test: an earlier version of
+    this feature also added every extra_roots entry directly to the
+    governed target list, which conflicts with symlink-following into a
+    broader trusted subtree -- see tasks/extra-roots-and-sys-paths.plan.md,
+    "Revision")."""
+    monkeypatch.setattr(svh, "DEFAULT_VOLATILE_PATHS", [])
+    home = tmp_path / "alice"
+    home.mkdir()
+    extra = tmp_path / "data" / "alice"
+    extra.mkdir(parents=True)
+    (extra / "file.txt").write_text("data")
+
+    monkeypatch.setattr(svh.Path, "home", lambda: home)
+    monkeypatch.setattr(svh, "require_tool", lambda name: None)
+    monkeypatch.setattr(svh, "get_fstype", lambda path: "btrfs")
+    monkeypatch.setattr(svh, "is_subvolume", lambda path: False)
+    monkeypatch.setattr(svh, "copy_contents", lambda src, dst: None)
+
+    args = SimpleNamespace(
+        paths=None,
+        extra_roots=[f"{tmp_path}/data/$USER"],
+        sys_paths=None,
+        config=tmp_path / "no-such-config.json",
+        dry_run=False,
+        yes=True,
+    )
+
+    svh.cmd_convert(args)
+
+    assert fake_btrfs_create == []
+    assert (extra / "file.txt").read_text() == "data"  # untouched
+
+
+def test_cmd_convert_skips_target_outside_home_and_extra_roots(tmp_path, monkeypatch, capsys, fake_btrfs_create):
+    """A target that resolves outside both $HOME and every configured
+    extra_root is refused -- the generalized form of the old
+    $HOME-only scope check."""
+    monkeypatch.setattr(svh, "DEFAULT_VOLATILE_PATHS", [])
+    home = tmp_path / "alice"
+    home.mkdir()
+
+    monkeypatch.setattr(svh.Path, "home", lambda: home)
+    monkeypatch.setattr(svh, "require_tool", lambda name: None)
+    monkeypatch.setattr(svh, "get_fstype", lambda path: "btrfs")
+    monkeypatch.setattr(svh, "is_subvolume", lambda path: False)
+
+    args = SimpleNamespace(
+        paths=["../escape"],
+        extra_roots=None,
+        sys_paths=None,
+        config=tmp_path / "no-such-config.json",
+        dry_run=False,
+        yes=True,
+    )
+
+    svh.cmd_convert(args)
+
+    assert fake_btrfs_create == []
+    assert "resolves outside of $HOME and configured extra_roots" in capsys.readouterr().out
+
+
+def test_cmd_convert_skips_absolute_paths_entry_not_covered_by_extra_roots(
+    tmp_path, monkeypatch, capsys, fake_btrfs_create
+):
+    """An absolute `paths` entry ($USER-validated in shape) still needs
+    to resolve within a configured extra_roots boundary -- listing it in
+    `paths` alone isn't itself an allowlist."""
+    monkeypatch.setattr(svh, "DEFAULT_VOLATILE_PATHS", [])
+    home = tmp_path / "alice"
+    home.mkdir()
+    uncovered = tmp_path / "data" / "alice" / "caches"
+    uncovered.parent.mkdir(parents=True)
+    uncovered.mkdir()
+
+    monkeypatch.setattr(svh.Path, "home", lambda: home)
+    monkeypatch.setattr(svh, "require_tool", lambda name: None)
+    monkeypatch.setattr(svh, "get_fstype", lambda path: "btrfs")
+    monkeypatch.setattr(svh, "is_subvolume", lambda path: False)
+
+    args = SimpleNamespace(
+        paths=[f"{tmp_path}/data/$USER/caches"],
+        extra_roots=None,  # no extra_roots configured at all
+        sys_paths=None,
+        config=tmp_path / "no-such-config.json",
+        dry_run=False,
+        yes=True,
+    )
+
+    svh.cmd_convert(args)
+
+    assert fake_btrfs_create == []
+    assert "resolves outside of $HOME and configured extra_roots" in capsys.readouterr().out
+
+
+def test_cmd_convert_sys_paths_bypasses_scope_check(tmp_path, monkeypatch, fake_btrfs_create):
+    """--sys-paths targets are processed even when nowhere near $HOME or
+    any configured extra_root -- the deliberately unguarded escape hatch."""
+    monkeypatch.setattr(svh, "DEFAULT_VOLATILE_PATHS", [])
+    home = tmp_path / "alice"
+    home.mkdir()
+    outside = tmp_path / "totally-unrelated-drive"
+    outside.mkdir()
+    (outside / "file.txt").write_text("data")
+
+    monkeypatch.setattr(svh.Path, "home", lambda: home)
+    monkeypatch.setattr(svh, "require_tool", lambda name: None)
+    monkeypatch.setattr(svh, "get_fstype", lambda path: "btrfs")
+    monkeypatch.setattr(svh, "is_subvolume", lambda path: False)
+    monkeypatch.setattr(svh, "copy_contents", lambda src, dst: None)
+
+    args = SimpleNamespace(
+        paths=None,
+        extra_roots=None,
+        sys_paths=[str(outside)],
+        config=tmp_path / "no-such-config.json",
+        dry_run=False,
+        yes=True,
+    )
+
+    svh.cmd_convert(args)
+
+    assert ["btrfs", "subvolume", "create", str(outside)] in fake_btrfs_create
+
+
+def test_cmd_convert_uniform_non_btrfs_skip_does_not_fail_run(tmp_path, monkeypatch, fake_btrfs_create, capsys):
+    """A target that passes the scope check but isn't on btrfs is
+    skipped -- uniformly, regardless of category -- without aborting the
+    run or affecting other targets (see is_within/check_target_is_btrfs
+    docstrings and tasks/extra-roots-and-sys-paths.plan.md)."""
+    monkeypatch.setattr(svh, "DEFAULT_VOLATILE_PATHS", [])
+    home = tmp_path / "alice"
+    home.mkdir()
+    bad = tmp_path / "not-btrfs-drive"
+    bad.mkdir()
+
+    monkeypatch.setattr(svh.Path, "home", lambda: home)
+    monkeypatch.setattr(svh, "require_tool", lambda name: None)
+    fstypes = {str(bad): "ext4"}
+    monkeypatch.setattr(svh, "get_fstype", lambda path: fstypes.get(str(path), "btrfs"))
+    monkeypatch.setattr(svh, "is_subvolume", lambda path: False)
+    monkeypatch.setattr(svh, "copy_contents", lambda src, dst: None)
+
+    args = SimpleNamespace(
+        paths=["gooddir"],
+        extra_roots=None,
+        sys_paths=[str(bad)],
+        config=tmp_path / "no-such-config.json",
+        dry_run=False,
+        yes=True,
+    )
+
+    svh.cmd_convert(args)  # must not sys.exit despite the skipped target
+
+    out = capsys.readouterr().out
+    assert "not btrfs" in out
+    assert ["btrfs", "subvolume", "create", str(home / "gooddir")] in fake_btrfs_create
+    assert not any(
+        c[:3] == ["btrfs", "subvolume", "create"] and c[3] == str(bad) for c in fake_btrfs_create
+    )
+
+
+def test_cmd_convert_follows_symlink_into_allowed_extra_root(tmp_path, monkeypatch, fake_btrfs_create):
+    """A symlink inside $HOME pointing into an allow-listed extra_root
+    has its *target* converted; the symlink itself is left untouched."""
+    monkeypatch.setattr(svh, "DEFAULT_VOLATILE_PATHS", [])
+    home = tmp_path / "alice"
+    home.mkdir()
+    extra_root_dir = tmp_path / "data" / "alice"
+    extra_root_dir.mkdir(parents=True)
+    caches_dir = extra_root_dir / "caches"
+    caches_dir.mkdir()
+    (caches_dir / "file.txt").write_text("cached")
+
+    symlink = home / "mysymlink"
+    symlink.symlink_to(caches_dir)
+
+    monkeypatch.setattr(svh.Path, "home", lambda: home)
+    monkeypatch.setattr(svh, "require_tool", lambda name: None)
+    monkeypatch.setattr(svh, "get_fstype", lambda path: "btrfs")
+    monkeypatch.setattr(svh, "is_subvolume", lambda path: False)
+    monkeypatch.setattr(svh, "copy_contents", lambda src, dst: None)
+
+    args = SimpleNamespace(
+        paths=["mysymlink"],
+        extra_roots=[f"{tmp_path}/data/$USER"],
+        sys_paths=None,
+        config=tmp_path / "no-such-config.json",
+        dry_run=False,
+        yes=True,
+    )
+
+    svh.cmd_convert(args)
+
+    assert symlink.is_symlink()
+    assert symlink.resolve() == caches_dir.resolve()
+    assert ["btrfs", "subvolume", "create", str(caches_dir)] in fake_btrfs_create
+    # extra_root_dir itself (the broader trust boundary) was never touched --
+    # extra_roots is a pure boundary, not a target (see
+    # test_cmd_convert_extra_roots_alone_is_never_a_target)
+    assert not any(
+        c[:3] == ["btrfs", "subvolume", "create"] and c[3] == str(extra_root_dir) for c in fake_btrfs_create
+    )
+
+
 def test_is_subvolume_uses_inode_256(tmp_path):
     plain_dir = tmp_path / "plain"
     plain_dir.mkdir()
@@ -263,6 +500,93 @@ def test_load_volatile_paths_layering_user_extends_system_and_builtin(tmp_path, 
     assert all(p in result for p in svh.DEFAULT_VOLATILE_PATHS)
 
 
+def test_load_extra_roots_explicit_missing_config_is_empty(tmp_path):
+    missing = tmp_path / "does_not_exist.json"
+    assert svh.load_extra_roots(missing) == []
+
+
+def test_load_extra_roots_explicit_config_used_standalone(tmp_path):
+    config = tmp_path / "paths.json"
+    config.write_text('{"paths": [".cache"], "extra_roots": ["/data/devspace/$USER/caches"]}')
+    assert svh.load_extra_roots(config) == ["/data/devspace/$USER/caches"]
+
+
+def test_load_extra_roots_missing_key_is_empty(tmp_path):
+    config = tmp_path / "paths.json"
+    config.write_text('{"paths": [".cache"]}')
+    assert svh.load_extra_roots(config) == []
+
+
+def test_load_extra_roots_malformed_array_is_empty(tmp_path, capsys):
+    config = tmp_path / "paths.json"
+    config.write_text('{"extra_roots": "not-a-list"}')
+    assert svh.load_extra_roots(config) == []
+    assert "invalid 'extra_roots' array" in capsys.readouterr().err
+
+
+def test_load_extra_roots_unreadable_file_is_empty_no_duplicate_warning(tmp_path, capsys):
+    config = tmp_path / "paths.json"
+    config.write_text("not valid json {{{")
+    assert svh.load_extra_roots(config) == []
+    assert capsys.readouterr().err == ""  # load_volatile_paths already warns about this file
+
+
+def test_load_extra_roots_layering_no_configs_is_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr(svh, "SYSTEM_CONFIG_PATH", tmp_path / "etc" / "paths.json")
+    monkeypatch.setattr(svh, "user_config_path", lambda: tmp_path / "home" / "paths.json")
+    assert svh.load_extra_roots(None) == []
+
+
+def test_load_extra_roots_layering_system_extends_builtin(tmp_path, monkeypatch):
+    system_path = tmp_path / "etc" / "paths.json"
+    system_path.parent.mkdir(parents=True)
+    system_path.write_text('{"extra_roots": ["/data/devspace/$USER/caches"]}')
+    monkeypatch.setattr(svh, "SYSTEM_CONFIG_PATH", system_path)
+    monkeypatch.setattr(svh, "user_config_path", lambda: tmp_path / "home" / "paths.json")
+
+    result = svh.load_extra_roots(None)
+
+    assert result == ["/data/devspace/$USER/caches"]
+
+
+def test_load_extra_roots_layering_user_extends_system(tmp_path, monkeypatch):
+    system_path = tmp_path / "etc" / "paths.json"
+    system_path.parent.mkdir(parents=True)
+    system_path.write_text('{"extra_roots": ["/data/devspace/$USER/caches"]}')
+    user_path = tmp_path / "home" / "paths.json"
+    user_path.parent.mkdir(parents=True)
+    user_path.write_text('{"extra_roots": ["/media/backup/$USER"]}')
+    monkeypatch.setattr(svh, "SYSTEM_CONFIG_PATH", system_path)
+    monkeypatch.setattr(svh, "user_config_path", lambda: user_path)
+
+    result = svh.load_extra_roots(None)
+
+    assert "/data/devspace/$USER/caches" in result
+    assert "/media/backup/$USER" in result
+
+
+def test_load_extra_roots_layering_no_duplicates(tmp_path, monkeypatch):
+    system_path = tmp_path / "etc" / "paths.json"
+    system_path.parent.mkdir(parents=True)
+    system_path.write_text('{"extra_roots": ["/data/devspace/$USER/caches"]}')
+    user_path = tmp_path / "home" / "paths.json"
+    user_path.parent.mkdir(parents=True)
+    user_path.write_text('{"extra_roots": ["/data/devspace/$USER/caches"]}')
+    monkeypatch.setattr(svh, "SYSTEM_CONFIG_PATH", system_path)
+    monkeypatch.setattr(svh, "user_config_path", lambda: user_path)
+
+    result = svh.load_extra_roots(None)
+
+    assert result.count("/data/devspace/$USER/caches") == 1
+
+
+def test_config_with_sys_paths_key_warns_and_is_ignored(tmp_path, capsys):
+    config = tmp_path / "paths.json"
+    config.write_text('{"paths": [".cache"], "sys_paths": ["/data/whatever"]}')
+    svh.load_extra_roots(config)
+    assert "'sys_paths' key" in capsys.readouterr().err
+
+
 def test_write_default_config_creates_file(tmp_path):
     config = tmp_path / "subdir" / "paths.json"
     args = SimpleNamespace(config=config, global_config=False)
@@ -321,6 +645,76 @@ def test_config_add_global_requires_root(monkeypatch):
         svh.cmd_config_add(args)
 
 
+def test_config_add_extra_root_creates_new_file(tmp_path):
+    config = tmp_path / "paths.json"
+    args = SimpleNamespace(config=config, global_config=False, path=["/data/devspace/$USER/caches"])
+    svh.cmd_config_add_extra_root(args)
+    loaded = svh.load_extra_roots(config)
+    assert loaded == ["/data/devspace/$USER/caches"]
+
+
+def test_config_add_extra_root_appends_to_existing_file(tmp_path):
+    config = tmp_path / "paths.json"
+    config.write_text('{"extra_roots": ["/data/devspace/$USER/existing"]}')
+    args = SimpleNamespace(config=config, global_config=False, path=["/media/backup/$USER"])
+    svh.cmd_config_add_extra_root(args)
+    loaded = svh.load_extra_roots(config)
+    assert loaded == ["/data/devspace/$USER/existing", "/media/backup/$USER"]
+
+
+def test_config_add_extra_root_skips_duplicates(tmp_path, capsys):
+    config = tmp_path / "paths.json"
+    config.write_text('{"extra_roots": ["/data/devspace/$USER/caches"]}')
+    args = SimpleNamespace(config=config, global_config=False, path=["/data/devspace/$USER/caches"])
+    svh.cmd_config_add_extra_root(args)
+    loaded = svh.load_extra_roots(config)
+    assert loaded == ["/data/devspace/$USER/caches"]
+    assert "no changes" in capsys.readouterr().out
+
+
+def test_config_add_extra_root_global_requires_root(monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    args = SimpleNamespace(config=None, global_config=True, path=["/data/devspace/$USER/caches"])
+    with pytest.raises(SystemExit, match="requires root"):
+        svh.cmd_config_add_extra_root(args)
+
+
+def test_config_add_extra_root_rejects_missing_placeholder(tmp_path):
+    config = tmp_path / "paths.json"
+    args = SimpleNamespace(config=config, global_config=False, path=["/data/shared-cache"])
+    with pytest.raises(SystemExit, match="extra_roots entries must be absolute"):
+        svh.cmd_config_add_extra_root(args)
+    assert not config.exists()
+
+
+def test_config_add_extra_root_rejects_relative(tmp_path):
+    config = tmp_path / "paths.json"
+    args = SimpleNamespace(config=config, global_config=False, path=["data/$USER/caches"])
+    with pytest.raises(SystemExit, match="extra_roots entries must be absolute"):
+        svh.cmd_config_add_extra_root(args)
+
+
+def test_config_add_does_not_clobber_extra_roots(tmp_path):
+    """Regression test for the bug _load_config_dict fixes: adding a
+    `paths` entry must not silently delete an existing `extra_roots` key
+    (or vice versa) in the same file."""
+    config = tmp_path / "paths.json"
+    config.write_text('{"extra_roots": ["/data/devspace/$USER/caches"]}')
+    args = SimpleNamespace(config=config, global_config=False, path=[".cache"])
+    svh.cmd_config_add(args)
+    assert svh.load_volatile_paths(config) == [".cache"]
+    assert svh.load_extra_roots(config) == ["/data/devspace/$USER/caches"]
+
+
+def test_config_add_extra_root_does_not_clobber_paths(tmp_path):
+    config = tmp_path / "paths.json"
+    config.write_text('{"paths": [".cache"]}')
+    args = SimpleNamespace(config=config, global_config=False, path=["/data/devspace/$USER/caches"])
+    svh.cmd_config_add_extra_root(args)
+    assert svh.load_volatile_paths(config) == [".cache"]
+    assert svh.load_extra_roots(config) == ["/data/devspace/$USER/caches"]
+
+
 def test_is_home_relative_plain_path(tmp_path):
     assert svh.is_home_relative(".cache") is True
     assert svh.is_home_relative(".var/app/*/cache") is True
@@ -365,23 +759,118 @@ def test_resolve_targets_glob_matching_nothing_is_skipped(tmp_path, capsys):
     assert "matched nothing" in capsys.readouterr().out
 
 
-def test_reject_non_home_relative_passes_valid_entries():
-    svh.reject_non_home_relative([".cache", ".npm"])  # should not raise
+def test_resolve_absolute_targets_plain_passthrough(tmp_path):
+    result = svh.resolve_absolute_targets(["/data/foo", "/media/bar"])
+    assert result == ["/data/foo", "/media/bar"]
 
 
-def test_reject_non_home_relative_rejects_absolute():
-    with pytest.raises(SystemExit, match="only operates within \\$HOME"):
-        svh.reject_non_home_relative([".cache", "/etc/bad"])
+def test_resolve_absolute_targets_glob(tmp_path):
+    (tmp_path / "app1").mkdir()
+    (tmp_path / "app2").mkdir()
+    result = svh.resolve_absolute_targets([str(tmp_path / "*")])
+    assert sorted(result) == sorted([str(tmp_path / "app1"), str(tmp_path / "app2")])
 
 
-def test_reject_non_home_relative_rejects_tilde():
-    with pytest.raises(SystemExit, match="only operates within \\$HOME"):
-        svh.reject_non_home_relative(["~/.cache"])
+def test_resolve_absolute_targets_glob_matching_nothing_is_skipped(tmp_path, capsys):
+    result = svh.resolve_absolute_targets([str(tmp_path / "nonexistent" / "*")])
+    assert result == []
+    assert "matched nothing" in capsys.readouterr().out
 
 
-def test_reject_non_home_relative_reports_all_bad_entries():
+def test_is_within_equal_root():
+    root = Path("/data")
+    assert svh.is_within(root, [root]) is True
+
+
+def test_is_within_nested_path():
+    root = Path("/data")
+    assert svh.is_within(root / "devspace" / "cache", [root]) is True
+
+
+def test_is_within_unrelated_sibling():
+    root = Path("/data")
+    assert svh.is_within(Path("/media/backup"), [root]) is False
+
+
+def test_is_within_multiple_roots():
+    roots = [Path("/home/alice"), Path("/data/devspace/alice")]
+    assert svh.is_within(Path("/data/devspace/alice/caches"), roots) is True
+    assert svh.is_within(Path("/etc/passwd"), roots) is False
+
+
+def test_existing_ancestor_returns_self_when_it_exists(tmp_path):
+    target = tmp_path / "cache"
+    target.mkdir()
+    assert svh.existing_ancestor(target) == target
+
+
+def test_existing_ancestor_walks_up_to_nearest_existing_parent(tmp_path):
+    missing = tmp_path / "not_yet" / "created" / "cache"
+    assert svh.existing_ancestor(missing) == tmp_path
+
+
+def test_check_target_is_btrfs_true(tmp_path, monkeypatch, capsys):
+    target = tmp_path / "cache"
+    target.mkdir()
+    monkeypatch.setattr(svh, "get_fstype", lambda path: "btrfs")
+    assert svh.check_target_is_btrfs(target) is True
+    assert capsys.readouterr().out == ""
+
+
+def test_check_target_is_btrfs_false_prints_skip(tmp_path, monkeypatch, capsys):
+    target = tmp_path / "cache"
+    target.mkdir()
+    monkeypatch.setattr(svh, "get_fstype", lambda path: "ext4")
+    assert svh.check_target_is_btrfs(target) is False
+    assert "not btrfs" in capsys.readouterr().out
+
+
+def test_check_target_is_btrfs_checks_nearest_existing_ancestor(tmp_path, monkeypatch):
+    missing = tmp_path / "not_yet" / "cache"
+    seen = {}
+
+    def fake_get_fstype(path):
+        seen["path"] = path
+        return "btrfs"
+
+    monkeypatch.setattr(svh, "get_fstype", fake_get_fstype)
+    assert svh.check_target_is_btrfs(missing) is True
+    assert seen["path"] == tmp_path
+
+
+def test_is_valid_paths_entry_home_relative():
+    assert svh.is_valid_paths_entry(".cache") is True
+
+
+def test_is_valid_paths_entry_absolute_with_user_placeholder():
+    assert svh.is_valid_paths_entry("/data/devspace/$USER/caches") is True
+
+
+def test_is_valid_paths_entry_rejects_absolute_without_placeholder():
+    assert svh.is_valid_paths_entry("/mnt/external/cache") is False
+
+
+def test_is_valid_paths_entry_rejects_tilde():
+    assert svh.is_valid_paths_entry("~/.cache") is False
+
+
+def test_reject_invalid_paths_entries_passes_valid_entries():
+    svh.reject_invalid_paths_entries([".cache", ".npm", "/data/devspace/$USER/caches"])  # should not raise
+
+
+def test_reject_invalid_paths_entries_rejects_absolute_without_placeholder():
+    with pytest.raises(SystemExit, match="paths` entries must be either"):
+        svh.reject_invalid_paths_entries([".cache", "/etc/bad"])
+
+
+def test_reject_invalid_paths_entries_rejects_tilde():
+    with pytest.raises(SystemExit, match="paths` entries must be either"):
+        svh.reject_invalid_paths_entries(["~/.cache"])
+
+
+def test_reject_invalid_paths_entries_reports_all_bad_entries():
     try:
-        svh.reject_non_home_relative([".cache", "/bad1", "~/bad2", "$HOME/bad3"])
+        svh.reject_invalid_paths_entries([".cache", "/bad1", "~/bad2", "$HOME/bad3"])
         pytest.fail("should have exited")
     except SystemExit as e:
         assert "/bad1" in str(e)
@@ -390,25 +879,90 @@ def test_reject_non_home_relative_reports_all_bad_entries():
         assert ".cache" not in str(e).split("Rejected:")[1]  # valid entry not listed as rejected
 
 
+def test_is_valid_extra_root_accepts_dollar_user(tmp_path):
+    assert svh.is_valid_extra_root("/data/devspace/$USER/caches") is True
+
+
+def test_is_valid_extra_root_accepts_braced_user(tmp_path):
+    assert svh.is_valid_extra_root("/data/devspace/${USER}/caches") is True
+
+
+def test_is_valid_extra_root_rejects_relative(tmp_path):
+    assert svh.is_valid_extra_root("data/$USER/caches") is False
+
+
+def test_is_valid_extra_root_rejects_missing_placeholder(tmp_path):
+    assert svh.is_valid_extra_root("/data/shared-cache") is False
+
+
+def test_reject_invalid_extra_roots_passes_valid_entries():
+    svh.reject_invalid_extra_roots(["/data/devspace/$USER/caches"])  # should not raise
+
+
+def test_reject_invalid_extra_roots_rejects_missing_placeholder():
+    with pytest.raises(SystemExit, match="extra_roots entries must be absolute"):
+        svh.reject_invalid_extra_roots(["/data/shared-cache"])
+
+
+def test_reject_invalid_extra_roots_rejects_relative():
+    with pytest.raises(SystemExit, match="extra_roots entries must be absolute"):
+        svh.reject_invalid_extra_roots(["data/$USER/caches"])
+
+
+def test_reject_invalid_extra_roots_reports_all_bad_entries():
+    try:
+        svh.reject_invalid_extra_roots(["/data/devspace/$USER/caches", "/bad1", "relative/$USER"])
+        pytest.fail("should have exited")
+    except SystemExit as e:
+        assert "/bad1" in str(e)
+        assert "relative/$USER" in str(e)
+        assert "/data/devspace/$USER/caches" not in str(e).split("Rejected:")[1]
+
+
+def test_expand_user_placeholder_dollar_form(tmp_path, monkeypatch):
+    monkeypatch.setattr(svh.Path, "home", lambda: tmp_path / "alice")
+    result = svh.expand_user_placeholder("/data/devspace/$USER/caches")
+    assert result == "/data/devspace/alice/caches"
+
+
+def test_expand_user_placeholder_braced_form(tmp_path, monkeypatch):
+    monkeypatch.setattr(svh.Path, "home", lambda: tmp_path / "bob")
+    result = svh.expand_user_placeholder("/data/devspace/${USER}/caches")
+    assert result == "/data/devspace/bob/caches"
+
+
+def test_expand_user_placeholder_no_placeholder_is_noop(tmp_path, monkeypatch):
+    monkeypatch.setattr(svh.Path, "home", lambda: tmp_path / "alice")
+    result = svh.expand_user_placeholder("/data/shared")
+    assert result == "/data/shared"
+
+
 def test_config_add_rejects_absolute_path(tmp_path):
     config = tmp_path / "paths.json"
     args = SimpleNamespace(config=config, global_config=False, path=["/mnt/external/cache"])
-    with pytest.raises(SystemExit, match="only operates within \\$HOME"):
+    with pytest.raises(SystemExit, match="paths` entries must be either"):
         svh.cmd_config_add(args)
     assert not config.exists()
+
+
+def test_config_add_accepts_absolute_with_user_placeholder(tmp_path):
+    config = tmp_path / "paths.json"
+    args = SimpleNamespace(config=config, global_config=False, path=["/data/devspace/$USER/caches"])
+    svh.cmd_config_add(args)
+    assert svh.load_volatile_paths(config) == ["/data/devspace/$USER/caches"]
 
 
 def test_config_add_rejects_tilde(tmp_path):
     config = tmp_path / "paths.json"
     args = SimpleNamespace(config=config, global_config=False, path=["~/.cache"])
-    with pytest.raises(SystemExit, match="only operates within \\$HOME"):
+    with pytest.raises(SystemExit, match="paths` entries must be either"):
         svh.cmd_config_add(args)
 
 
 def test_config_add_rejects_home_var(tmp_path):
     config = tmp_path / "paths.json"
     args = SimpleNamespace(config=config, global_config=False, path=["$HOME/.cache"])
-    with pytest.raises(SystemExit, match="only operates within \\$HOME"):
+    with pytest.raises(SystemExit, match="paths` entries must be either"):
         svh.cmd_config_add(args)
 
 
@@ -417,7 +971,7 @@ def test_config_add_mixed_valid_and_invalid_rejects_whole_batch(tmp_path):
     whole batch rather than silently applying only the valid ones."""
     config = tmp_path / "paths.json"
     args = SimpleNamespace(config=config, global_config=False, path=[".cache", "/etc/bad"])
-    with pytest.raises(SystemExit, match="only operates within \\$HOME"):
+    with pytest.raises(SystemExit, match="paths` entries must be either"):
         svh.cmd_config_add(args)
     assert not config.exists()
 
@@ -439,6 +993,15 @@ def test_config_list_prints_effective_paths(tmp_path, capsys):
     assert out == svh.DEFAULT_VOLATILE_PATHS  # config doesn't exist -> falls back to builtin
 
 
+def test_config_list_includes_extra_roots_section(tmp_path, capsys):
+    config = tmp_path / "paths.json"
+    config.write_text('{"paths": [".cache"], "extra_roots": ["/data/devspace/$USER/caches"]}')
+    args = SimpleNamespace(config=config)
+    svh.cmd_config_list(args)
+    out = capsys.readouterr().out.splitlines()
+    assert out == [".cache", "", "extra_roots:", "  /data/devspace/$USER/caches"]
+
+
 def test_install_per_user_copies_self(tmp_path, monkeypatch):
     monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
     args = SimpleNamespace(global_install=False, service=False)
@@ -457,6 +1020,29 @@ def test_install_global_requires_root(monkeypatch):
 
     with pytest.raises(SystemExit, match="requires root"):
         svh.cmd_install(args)
+
+
+def test_install_service_requires_systemctl(tmp_path, monkeypatch):
+    monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(svh.shutil, "which", lambda name: None if name == "systemctl" else "/usr/bin/true")
+    copy_calls = []
+    monkeypatch.setattr(svh.shutil, "copy2", lambda src, dst: copy_calls.append((src, dst)))
+    args = SimpleNamespace(global_install=False, service=True)
+
+    with pytest.raises(SystemExit, match="systemctl"):
+        svh.cmd_install(args)
+
+    assert copy_calls == []  # failed before touching the filesystem
+
+
+def test_install_without_service_does_not_require_systemctl(tmp_path, monkeypatch):
+    monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(svh.shutil, "which", lambda name: None if name == "systemctl" else "/usr/bin/true")
+    args = SimpleNamespace(global_install=False, service=False)
+
+    svh.cmd_install(args)  # should not raise
+
+    assert (tmp_path / ".local/bin/subvolumize-home").is_file()
 
 
 def test_install_per_user_service_writes_correct_unit(tmp_path, monkeypatch):

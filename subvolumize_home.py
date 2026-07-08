@@ -9,7 +9,10 @@ of the rest of the home directory.
 
 Safety model
 ------------
-1. Refuses to do anything unless $HOME is actually on a btrfs filesystem.
+1. Every target is checked individually for being on btrfs (not just
+   $HOME up front) -- targets outside $HOME (see extra_roots/--sys-paths
+   below) may live on a different filesystem than $HOME does. A target
+   that isn't on btrfs is skipped, not fatal to the rest of the run.
 2. For every target path, checks whether it is *already* a subvolume
    (via the inode-256 heuristic, no sudo needed) and skips it if so.
 3. Conversion never deletes data blindly:
@@ -23,6 +26,14 @@ Safety model
        renamed back into place, so you never end up worse off
 4. Dry-run by default in the sense that every change is printed; use
    --yes to skip the interactive per-path confirmation.
+5. `paths` entries (default list, config, --paths) are usually relative
+   to $HOME, but may also be absolute + contain a $USER placeholder --
+   in which case they must resolve within a configured `extra_roots`
+   boundary (config key or --extra-roots) to be allowed. `extra_roots`
+   is *only* a trust boundary, never itself converted. --sys-paths is a
+   separate, deliberately unguarded escape hatch (CLI-only, never read
+   from a config file) for one-off manual conversions with no boundary
+   check at all. See README for the full model.
 
 Usage
 -----
@@ -30,9 +41,13 @@ Usage
     ./subvolumize_home.py                    # interactive, asks per path
     ./subvolumize_home.py --yes              # no prompts
     ./subvolumize_home.py --paths .cache .npm --yes
-    ./subvolumize_home.py config list        # show the effective path list
-    ./subvolumize_home.py config add .cache  # add a path to your config
-    ./subvolumize_home.py config example     # write a starter config file
+    ./subvolumize_home.py --paths /data/devspace/$USER/caches \\
+        --extra-roots /data/devspace/$USER --yes
+    ./subvolumize_home.py --sys-paths /data/one-off-drive --yes
+    ./subvolumize_home.py config list             # show the effective config
+    ./subvolumize_home.py config add .cache       # add a `paths` entry
+    ./subvolumize_home.py config add-extra-root /data/devspace/$USER
+    ./subvolumize_home.py config example          # write a starter config file
 """
 
 import argparse
@@ -150,37 +165,116 @@ def is_home_relative(entry: str) -> bool:
     ".cache", ".var/app/*/cache") rather than an absolute path or one
     using ~/$HOME/${HOME} expansion.
 
-    subvolumize-home only ever operates within the home directory --
-    unlike flatpak-relink-appdata's source/target (which can legitimately
-    point anywhere, e.g. a backup drive), every entry here is meant to be
-    "a subdirectory of $HOME", full stop. So unlike that tool, this one
-    deliberately does NOT support ~/$HOME expansion or absolute paths:
-    supporting them would just be an escape hatch for a model that
-    doesn't want one. A path that manages to sneak past this and still
-    resolves outside $HOME is still caught later regardless, at the
-    point paths are actually resolved (see cmd_convert) -- this check
-    exists to give a fast, clear error at config-edit time instead of a
-    silent skip much later.
+    This is one of the two valid shapes for a `paths` entry -- the other
+    being an absolute, $USER-validated extra_root shape (see
+    is_valid_extra_root, is_valid_paths_entry). Unlike
+    flatpak-relink-appdata's source/target (which can legitimately point
+    anywhere, e.g. a backup drive), a home-relative `paths` entry is
+    meant to be "a subdirectory of $HOME", full stop -- there's
+    deliberately no ~/$HOME expansion here.
     """
     return not (entry.startswith("/") or entry.startswith("~") or "$HOME" in entry or "${HOME}" in entry)
 
 
-def reject_non_home_relative(entries: list) -> None:
+def is_valid_extra_root(entry: str) -> bool:
     """
-    Exit with a clear, whole-batch error if any entry isn't home-relative
-    (see is_home_relative). Used at every entry point that can introduce
-    paths into a run -- `config add`, `--paths`, and the normal
-    config-loading path -- so a bad entry is caught immediately and
-    loudly, the same way everywhere, rather than only via the much later
-    per-path "resolves outside $HOME" skip during actual conversion.
+    True if `entry` is shaped like a valid extra_root: an absolute path
+    containing a $USER (or ${USER}) placeholder.
+
+    Used for two things that share the exact same validity rule:
+    - `extra_roots` entries themselves (the trust boundary -- see
+      cmd_convert; an extra_root is never itself a conversion target).
+    - the *other* valid shape for a `paths` entry (see
+      is_valid_paths_entry) -- an absolute path you want directly
+      converted must still be $USER-validated for the same reason
+      extra_roots entries are.
+
+    extra_roots is how this tool is allowed to touch anything outside
+    $HOME at all -- opt-in, and only for paths the user explicitly lists.
+    Automatic runs (the login systemd --user service) always run as the
+    invoking user, never root, so there's no privilege-escalation risk
+    from that alone. The real risk is multiple users' automatic runs
+    colliding on the same literal shared path (e.g. a sysadmin's /etc
+    config listing "/data/shared-cache" verbatim -- every user's login
+    service would then fight over that one path). Requiring a $USER
+    placeholder means the same shared config layer still expands to a
+    distinct, private subtree per user.
     """
-    bad = [e for e in entries if not is_home_relative(e)]
+    return entry.startswith("/") and ("$USER" in entry or "${USER}" in entry)
+
+
+def is_valid_paths_entry(entry: str) -> bool:
+    """
+    True if `entry` is acceptable in the `paths` list: either
+    $HOME-relative (the common case), or an absolute, $USER-validated
+    extra_root shape (for a path you want directly converted that lives
+    outside $HOME -- it must also resolve within a configured
+    extra_roots boundary at run time, checked later in cmd_convert, the
+    same "fast config-time check, real check deferred to resolution
+    time" split as everywhere else in this file).
+    """
+    return is_home_relative(entry) or is_valid_extra_root(entry)
+
+
+def reject_invalid_paths_entries(entries: list) -> None:
+    """
+    Exit with a clear, whole-batch error if any entry isn't valid in the
+    `paths` list (see is_valid_paths_entry). Used at every entry point
+    that can introduce `paths` entries into a run -- `config add`,
+    `--paths`, and the normal config-loading path -- so a bad entry is
+    caught immediately and loudly, the same way everywhere, rather than
+    only via the much later per-path "resolves outside $HOME and
+    configured extra_roots" skip during actual conversion.
+    """
+    bad = [e for e in entries if not is_valid_paths_entry(e)]
     if bad:
         sys.exit(
-            "error: subvolumize-home only operates within $HOME, so entries must be plain "
-            "paths relative to it (e.g. \".cache\"), not absolute paths or ~/$HOME expansion.\n"
+            "error: `paths` entries must be either plain paths relative to $HOME "
+            "(e.g. \".cache\") or absolute paths containing a $USER (or ${USER}) "
+            "placeholder (e.g. \"/data/devspace/$USER/caches\", which must also fall "
+            "within a configured extra_roots boundary) -- not ~/$HOME expansion, and "
+            "not an absolute path without a $USER placeholder.\n"
             f"Rejected: {', '.join(bad)}"
         )
+
+
+def reject_invalid_extra_roots(entries: list) -> None:
+    """
+    Exit with a clear, whole-batch error if any entry isn't a valid
+    extra_roots entry (see is_valid_extra_root). Used at every entry
+    point that can introduce extra_roots entries -- `config
+    add-extra-root`, `--extra-roots`, and the normal config-loading path.
+
+    For a one-off absolute path that doesn't fit this mold (no $USER
+    placeholder needed, or wanted), --sys-paths is the escape hatch --
+    CLI-only, unguarded, never read from a config file.
+    """
+    bad = [e for e in entries if not is_valid_extra_root(e)]
+    if bad:
+        sys.exit(
+            "error: extra_roots entries must be absolute paths containing a $USER "
+            "(or ${USER}) placeholder, e.g. \"/data/devspace/$USER/caches\" -- this "
+            "keeps automatic/config-driven runs from colliding across multiple users "
+            "sharing that storage. For a one-off manual path outside $HOME that you're "
+            "converting yourself, use --sys-paths instead (CLI-only, not usable in a "
+            "config file, not $USER-validated).\n"
+            f"Rejected: {', '.join(bad)}"
+        )
+
+
+def expand_user_placeholder(entry: str) -> str:
+    """
+    Replace $USER / ${USER} in an extra_roots entry with the invoking
+    user's name.
+
+    Deliberately uses Path.home().name rather than os.environ["USER"]:
+    the rest of this file already treats Path.home() as the one source
+    of truth for "who is running this" (see is_subvolume, cmd_convert),
+    it's reliable under systemd --user (which doesn't always populate
+    $USER), and it's the same thing tests already monkeypatch.
+    """
+    username = Path.home().name
+    return entry.replace("${USER}", username).replace("$USER", username)
 
 
 SYSTEM_CONFIG_PATH = Path("/etc/subvolumize-home/paths.json")
@@ -245,6 +339,73 @@ def load_volatile_paths(config_path: Optional[Path]) -> list:
     return result
 
 
+def _read_extra_roots_array(path: Path) -> list:
+    """
+    Read a config file's optional 'extra_roots' array.
+
+    Independent of _read_paths_array (own read, own error handling)
+    because the two keys have different validity rules: 'paths' missing
+    or malformed invalidates the whole layer (see load_volatile_paths);
+    'extra_roots' is opt-in, so a config with only a 'paths' key is
+    completely normal and should just contribute an empty extra_roots
+    list, not a warning. A read/parse failure of the file itself isn't
+    re-warned here -- load_volatile_paths() already reports that for the
+    same file when it loads 'paths' from it.
+
+    Also warns (once per file) about a top-level 'sys_paths' key: that
+    name is reserved for the CLI-only --sys-paths flag and must never be
+    honored from a config file, so if one shows up here it's surfaced
+    loudly rather than silently doing nothing.
+    """
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+
+    if "sys_paths" in data:
+        print(
+            f"warning: config {path} has a 'sys_paths' key -- not supported in config "
+            "files (CLI-only, see --sys-paths --help), ignoring",
+            file=sys.stderr,
+        )
+
+    roots = data.get("extra_roots")
+    if roots is None:
+        return []
+    if not isinstance(roots, list) or not all(isinstance(r, str) for r in roots):
+        print(f"warning: config {path} has an invalid 'extra_roots' array, ignoring it", file=sys.stderr)
+        return []
+    return roots
+
+
+def load_extra_roots(config_path: Optional[Path]) -> list:
+    """
+    Load the list of extra_roots entries (see is_valid_extra_root).
+
+    Same standalone-vs-layered rules as load_volatile_paths, except the
+    true built-in default is empty -- extra_roots is opt-in trust, there
+    is no sensible built-in list of trusted paths outside $HOME.
+    """
+    if config_path is not None:
+        if not config_path.exists():
+            return []
+        return _read_extra_roots_array(config_path)
+
+    result = []
+    seen = set()
+    for candidate in (SYSTEM_CONFIG_PATH, user_config_path()):
+        if not candidate.exists():
+            continue
+        extra = _read_extra_roots_array(candidate)
+        new = [r for r in extra if r not in seen]
+        seen.update(new)
+        result.extend(new)
+        if new:
+            print(f"Extended extra_roots with {len(new)} new entry(ies) from {candidate}", file=sys.stderr)
+
+    return result
+
+
 def _config_target_path(args) -> Path:
     """Resolve which file `config add`/`config example` should write to,
     based on --global (system layer, requires root) vs the default
@@ -256,38 +417,72 @@ def _config_target_path(args) -> Path:
     return args.config or user_config_path()
 
 
+def _load_config_dict(path: Path) -> dict:
+    """
+    Read a config file as a raw dict, for commands that need to update
+    one key (e.g. 'paths') while leaving whatever else is in the file
+    (e.g. 'extra_roots') untouched.
+
+    Returns {} if the file doesn't exist yet. Exits with a clear error
+    if it exists but isn't valid JSON -- a config-writing command should
+    never silently clobber a file it can't actually parse.
+    """
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        sys.exit(f"error: {path} exists but isn't valid JSON: {exc}")
+    return data if isinstance(data, dict) else {}
+
+
 def cmd_config_list(args) -> None:
     for entry in load_volatile_paths(args.config):
         print(entry)
+    extra_roots = load_extra_roots(args.config)
+    if extra_roots:
+        print()
+        print("extra_roots:")
+        for entry in extra_roots:
+            print(f"  {entry}")
 
 
 def cmd_config_add(args) -> None:
-    reject_non_home_relative(args.path)
+    reject_invalid_paths_entries(args.path)
 
     path = _config_target_path(args)
+    data = _load_config_dict(path)
+    paths = data.get("paths") if isinstance(data.get("paths"), list) else []
 
-    paths = []
-    if path.exists():
-        try:
-            data = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError) as exc:
-            sys.exit(f"error: {path} exists but isn't valid JSON: {exc}")
-        existing = data.get("paths")
-        if isinstance(existing, list):
-            paths = existing
-
-    added = []
-    for p in args.path:
-        if p not in paths:
-            paths.append(p)
-            added.append(p)
+    added = [p for p in args.path if p not in paths]
+    paths.extend(added)
+    data["paths"] = paths
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"paths": paths}, indent=2) + "\n")
+    path.write_text(json.dumps(data, indent=2) + "\n")
     if added:
         print(f"added {', '.join(added)} to {path}")
     else:
         print(f"no changes: all given path(s) already present in {path}")
+
+
+def cmd_config_add_extra_root(args) -> None:
+    reject_invalid_extra_roots(args.path)
+
+    path = _config_target_path(args)
+    data = _load_config_dict(path)
+    roots = data.get("extra_roots") if isinstance(data.get("extra_roots"), list) else []
+
+    added = [r for r in args.path if r not in roots]
+    roots.extend(added)
+    data["extra_roots"] = roots
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    if added:
+        print(f"added {', '.join(added)} to {path}")
+    else:
+        print(f"no changes: all given extra_root(s) already present in {path}")
 
 
 def cmd_config_example(args) -> None:
@@ -467,6 +662,13 @@ def cmd_install(args) -> None:
     """Install this script (and optionally its systemd --user unit) so it
     runs automatically at login -- either for the current user only, or
     system-wide for every user (present and future) via --global."""
+    if args.service:
+        # Fail before touching the filesystem: without this, a missing
+        # systemctl would only surface after the binary was already
+        # copied into place and the unit file already written, leaving
+        # a partial, confusing install.
+        require_tool("systemctl")
+
     self_path = Path(__file__).resolve()
 
     if args.global_install:
@@ -535,9 +737,76 @@ def resolve_targets(targets: list, home: Path) -> list:
     return resolved
 
 
+def resolve_absolute_targets(entries: list) -> list:
+    """
+    Like resolve_targets, but for entries that are already absolute
+    (extra_roots, sys_paths) -- no $HOME prefix is joined, entries are
+    used as-is (after any $USER expansion the caller already did).
+    """
+    resolved = []
+    for entry in entries:
+        if any(ch in entry for ch in "*?["):
+            matches = sorted(globmod.glob(entry))
+            if not matches:
+                print(f"[skip] glob {entry!r} matched nothing")
+                continue
+            resolved.extend(matches)
+        else:
+            resolved.append(entry)
+    return resolved
+
+
+def is_within(path: Path, roots: list) -> bool:
+    """True if `path` is one of `roots`, or nested under one of them."""
+    return any(path == root or root in path.parents for root in roots)
+
+
+def existing_ancestor(path: Path) -> Path:
+    """
+    Walk `path` then its parents until one actually exists on disk.
+
+    Needed for the btrfs check on a target that doesn't exist yet (e.g.
+    a `paths`/`extra_roots` entry about to be created fresh): `findmnt
+    --target` needs something real to inspect, so we check the nearest
+    existing ancestor instead -- the directory the new subvolume would
+    actually be created in.
+    """
+    for candidate in (path, *path.parents):
+        if candidate.exists():
+            return candidate
+    return path  # unreachable in practice: the filesystem root always exists
+
+
+def check_target_is_btrfs(path: Path) -> bool:
+    """
+    True if `path` (or its nearest existing ancestor, if it doesn't
+    exist yet) is on a btrfs filesystem. Prints a [skip] with the actual
+    fstype otherwise.
+
+    This is a per-target check, applied uniformly regardless of whether
+    the target came from `paths`, `extra_roots`, `--sys-paths`, or a
+    followed symlink -- once targets can live outside $HOME, each one
+    can legitimately be on a different filesystem, so there's no single
+    upfront check that covers all of them (see cmd_convert).
+    """
+    fstype = get_fstype(existing_ancestor(path))
+    if fstype != "btrfs":
+        print(f"[skip]   {path} is on '{fstype}', not btrfs, refusing")
+        return False
+    return True
+
+
 def cmd_convert(args) -> None:
-    targets = args.paths if args.paths else load_volatile_paths(args.config)
-    reject_non_home_relative(targets)
+    paths_targets = args.paths if args.paths else load_volatile_paths(args.config)
+    reject_invalid_paths_entries(paths_targets)
+    home_relative_targets = [e for e in paths_targets if is_home_relative(e)]
+    absolute_paths_targets = [expand_user_placeholder(e) for e in paths_targets if not is_home_relative(e)]
+
+    extra_root_entries = args.extra_roots if args.extra_roots else load_extra_roots(args.config)
+    reject_invalid_extra_roots(extra_root_entries)
+    extra_root_entries = [expand_user_placeholder(e) for e in extra_root_entries]
+
+    sys_path_entries = args.sys_paths or []
 
     require_tool("findmnt")
     require_tool("btrfs")
@@ -547,22 +816,36 @@ def cmd_convert(args) -> None:
     print(f"Home directory: {home}")
     fstype = get_fstype(home)
     if fstype != "btrfs":
-        sys.exit(f"error: {home} is on '{fstype}', not btrfs. Aborting, nothing was changed.")
-    print("Confirmed: home is on btrfs.")
-
-    if is_subvolume(home):
-        print(f"Note: {home} itself is a btrfs subvolume (as expected).")
+        print(f"Warning: {home} is on '{fstype}', not btrfs. $HOME-relative targets will be "
+              f"skipped individually below; this no longer aborts the whole run, since targets "
+              f"outside $HOME (extra_roots, --sys-paths) may live on a different filesystem.")
+    elif is_subvolume(home):
+        print(f"Confirmed: {home} is on btrfs and is itself a subvolume (as expected).")
     else:
-        print(f"Warning: {home} is on btrfs but is not itself a subvolume root "
+        print(f"Confirmed: {home} is on btrfs, but is not itself a subvolume root "
               f"(it may be a plain directory inside a larger subvolume). Continuing anyway.")
 
-    expanded = resolve_targets(targets, home)
+    # extra_roots is a pure trust boundary -- it is never itself a
+    # conversion target (see tasks/extra-roots-and-sys-paths.plan.md,
+    # "Revision"). A path you want directly converted outside $HOME goes
+    # in `paths` (absolute + $USER-validated) and must resolve within one
+    # of these roots to pass the scope check below, same as a symlink
+    # resolving into one does.
+    allowed_roots = [home] + [Path(e).resolve() for e in extra_root_entries]
+
+    governed = resolve_targets(home_relative_targets, home) + resolve_absolute_targets(absolute_paths_targets)
+    ungoverned = resolve_absolute_targets(sys_path_entries)
+    expanded = [(t, True) for t in governed] + [(t, False) for t in ungoverned]
 
     successes, failures = [], []
-    for raw in expanded:
+    for raw, governed_flag in expanded:
         path = Path(raw).resolve()
-        if home not in path.parents and path != home:
-            print(f"[skip] {raw} resolves outside of $HOME ({path}), refusing for safety")
+        if governed_flag and not is_within(path, allowed_roots):
+            print(f"[skip] {raw} resolves outside of $HOME and configured extra_roots "
+                  f"({path}), refusing for safety")
+            continue
+
+        if not check_target_is_btrfs(path):
             continue
 
         if not args.yes and not args.dry_run:
@@ -593,6 +876,24 @@ def main():
         nargs="+",
         default=None,
         help="paths relative to $HOME to convert (default: a built-in list of common cache/volatile dirs)",
+    )
+    parser.add_argument(
+        "--extra-roots",
+        nargs="+",
+        default=None,
+        help="trust boundary for absolute paths outside $HOME (never a target itself) -- "
+             "each must contain a $USER placeholder (e.g. /data/devspace/$USER/caches); "
+             "an absolute --paths entry or a followed symlink must resolve within one of "
+             "these to be allowed; overrides the layered config's extra_roots entirely, "
+             "the same way --paths overrides paths",
+    )
+    parser.add_argument(
+        "--sys-paths",
+        nargs="+",
+        default=None,
+        help="absolute paths to convert with NO safety checks beyond the per-target btrfs "
+             "check -- not restricted to $HOME or extra_roots, never read from a config "
+             "file, use only when you know exactly what you're converting",
     )
     parser.add_argument("--dry-run", action="store_true", help="show what would happen, change nothing")
     parser.add_argument("--yes", action="store_true", help="do not prompt for confirmation before each conversion")
@@ -634,8 +935,24 @@ def main():
     config_sub.add_parser("list", help="show the effective (merged) path list")
 
     add_parser = config_sub.add_parser("add", help="add one or more paths")
-    add_parser.add_argument("path", nargs="+", help="path(s) relative to $HOME to add")
     add_parser.add_argument(
+        "path", nargs="+",
+        help="path(s) relative to $HOME to add, or absolute paths containing a $USER "
+             "placeholder (must resolve within a configured extra_roots boundary)",
+    )
+    add_parser.add_argument(
+        "--global", dest="global_config", action="store_true",
+        help=f"write to {SYSTEM_CONFIG_PATH} instead of the per-user location (requires root)",
+    )
+
+    add_extra_root_parser = config_sub.add_parser(
+        "add-extra-root", help="add one or more extra_roots entries (see --extra-roots --help)"
+    )
+    add_extra_root_parser.add_argument(
+        "path", nargs="+",
+        help="absolute path(s) containing a $USER placeholder, e.g. /data/devspace/$USER/caches",
+    )
+    add_extra_root_parser.add_argument(
         "--global", dest="global_config", action="store_true",
         help=f"write to {SYSTEM_CONFIG_PATH} instead of the per-user location (requires root)",
     )
@@ -657,6 +974,8 @@ def main():
             cmd_config_list(args)
         elif args.config_command == "add":
             cmd_config_add(args)
+        elif args.config_command == "add-extra-root":
+            cmd_config_add_extra_root(args)
         elif args.config_command == "example":
             cmd_config_example(args)
         else:

@@ -85,6 +85,12 @@ subvolumize-home --paths .cache .npm --yes    # only these two, ignoring config
 subvolumize-home config list                  # see the effective path list
 ```
 
+Every target is checked individually for being on btrfs before
+conversion (not just $HOME up front) -- a target that isn't on btrfs is
+skipped, not fatal to the rest of the run. This matters once targets
+can live outside $HOME (see extra_roots below): each one may sit on a
+different filesystem than $HOME does, or than each other.
+
 ### Configuring which paths get converted
 
 Config is layered, lowest to highest priority, each layer **extending**
@@ -114,20 +120,104 @@ Either file looks like:
 }
 ```
 
-Entries must be plain paths relative to `$HOME` (like the examples
-above) -- `subvolumize-home` only ever touches things inside your home
-directory, so absolute paths and `~`/`$HOME`/`${HOME}` expansion are
-deliberately not supported here (unlike `flatpak-relink-appdata` below,
-where `source` can legitimately point anywhere, e.g. a backup drive).
-This is enforced consistently everywhere a path can enter a run --
-`config add`, `--paths`, and normal config loading all reject a
-non-relative entry immediately with a clear error, rather than
+Entries are normally plain paths relative to `$HOME` (like the examples
+above); `~`/`$HOME`/`${HOME}` expansion is deliberately not supported
+(unlike `flatpak-relink-appdata` below, where `source` can legitimately
+point anywhere, e.g. a backup drive). An entry may also be absolute with
+a `$USER` placeholder, for a path outside $HOME you want directly
+converted -- see "Allowing paths outside $HOME" below; it must also
+fall within a configured `extra_roots` boundary to actually be used.
+This shape is enforced consistently everywhere a path can enter a run --
+`config add`, `--paths`, and normal config loading all reject an
+entry that's neither shape immediately with a clear error, rather than
 silently accepting it only to skip it later once the tool is already
 running.
 
 Pass `--config /some/other/path.json` to bypass layering entirely and
 use exactly that one file, standalone -- the same way `--paths` already
 works as a full override.
+
+### Allowing paths outside $HOME: extra_roots and --sys-paths
+
+`subvolumize-home` is deliberately limited to $HOME by default. Two
+users' real-world needs don't fit that, though: owning additional
+storage outside $HOME (`/data`, `/media/...`) that they want converted
+too, and having paths *inside* $HOME that are actually symlinks onto
+such storage (e.g. `~/Documents -> /data/documents`). Both are covered,
+but neither is a blanket "allow anything outside $HOME" switch.
+
+**Trust model.** Automatic runs (the login systemd `--user` service)
+always run as the invoking user, never root -- there's no
+privilege-escalation risk from allowing extra paths. The actual risk is
+**multiple users' automatic runs colliding on the same literal shared
+path** (e.g. a sysadmin's `/etc` config listing `/data/shared-cache`
+verbatim would have every user's login service fighting over that one
+path). That's what the `$USER` requirement below solves.
+
+**`extra_roots`** is an opt-in, config-driven **trust boundary** --
+never a target itself, just a statement of "this subtree is allowed."
+Layered the same way `paths` is (system, then per-user, each extending
+the last). Every entry must be absolute and contain a `$USER` (or
+`${USER}`) placeholder:
+
+```json
+{
+  "paths": [".cache", ".npm", "/data/devspace/$USER/caches"],
+  "extra_roots": ["/data/devspace/$USER"]
+}
+```
+
+```bash
+subvolumize-home config add-extra-root /data/devspace/'$USER'
+subvolumize-home config add /data/devspace/'$USER'/caches
+subvolumize-home --extra-roots /data/devspace/'$USER' --paths /data/devspace/'$USER'/caches --yes
+```
+
+`$USER` expands to the invoking user's name at load time (quote it in
+your shell, as above, so the shell doesn't try to expand it itself).
+
+`extra_roots` only ever *allows* -- it is deliberately never added to
+the conversion list by itself. To directly convert an absolute path
+(the "I own /data, convert it too" case, no symlink involved), list it
+in **`paths`** instead: a `paths` entry can now be either $HOME-relative
+(the common case) or absolute with a `$USER` placeholder, and an
+absolute one must resolve within a configured `extra_roots` entry to be
+allowed. This split matters: a broad `extra_roots` entry (e.g. the
+whole `/data/devspace/$USER` subtree, so *any* symlink pointing
+somewhere under it is trusted) staying purely a boundary means it's
+never itself wholesale converted -- which would otherwise conflict with
+something nested inside it being converted separately (either
+redundant, or incoherent at the btrfs level: you can't sensibly turn a
+directory into a subvolume while something inside it is, or is about
+to become, its own nested subvolume). `extra_roots` is **not** combined
+with `paths` beyond that boundary check (an `extra_roots` entry of
+`/data` plus a `paths` entry of `.npm` does **not** produce
+`/data/.npm`; list the full absolute path you want converted directly
+in `paths`).
+
+**Symlinks inside $HOME are followed automatically.** If `~/Documents`
+is a symlink to `/data/documents`, and `/data/documents` is covered by
+an `extra_roots` entry (or is inside $HOME), running `subvolumize-home`
+converts `/data/documents` itself, leaving the symlink in place now
+pointing at a subvolume. A symlink pointing somewhere *not* covered by
+$HOME or any configured `extra_roots` is left alone, with a message
+suggesting you add its target's root to `extra_roots`.
+
+**`--sys-paths`** is a separate, deliberately **unguarded** escape
+hatch for one-off manual conversions: absolute paths, no `$USER`
+requirement, not subject to the $HOME/`extra_roots` check.
+
+```bash
+subvolumize-home --sys-paths /data/one-off-drive --yes
+```
+
+It is **CLI-only** -- there is no config key for it, and a config file
+containing a `sys_paths` key is rejected with a warning and ignored.
+The reasoning: a manual `--sys-paths` invocation means you know exactly
+what you're converting; a config file is shared and/or drives the
+automatic login service, so it doesn't get that same trust. Never add
+`--sys-paths` to the systemd unit yourself -- `subvolumize-home
+install --service` never does.
 
 ## flatpak-relink-appdata usage
 
