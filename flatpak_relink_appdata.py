@@ -10,20 +10,22 @@ reinstall, logging back in reconnects everything automatically -- in
 whatever order the pieces (OS, dotfiles, flatpak apps, this script)
 happen to come back.
 
-Configure via ~/.config/subvolumize-home/flatpak-relink.toml (or --config):
+Configure via ~/.config/subvolumize-home/flatpak-relink.json (or --config):
 
-    [[app]]
-    app_id = "org.mozilla.firefox"
-    source = "~/AppData/firefox-profile"
-    target = "~/.var/app/org.mozilla.firefox/.mozilla/firefox"
+    {
+      "app": [
+        {
+          "app_id": "org.mozilla.firefox",
+          "source": "~/AppData/firefox-profile",
+          "target": "~/.var/app/org.mozilla.firefox/.mozilla/firefox"
+        }
+      ]
+    }
 
-    [[app]]
-    app_id = "org.chromium.Chromium"
-    source = "~/AppData/chromium-profile"
-    target = "~/.var/app/org.chromium.Chromium/config/chromium"
-
-If no config file exists, a small built-in default covering Firefox and
-Chromium is used. Run --write-default-config to generate a starter file.
+The true built-in default is empty -- this tool does nothing until you
+configure it. Run `config example` for a starter file (Firefox +
+Chromium), or `config add --app ... --src ... --target ...` to add
+entries one at a time. `config list` shows the effective (merged) set.
 
 Safety model per entry:
   - target missing                -> just symlink it to source (creating
@@ -64,6 +66,14 @@ class Mapping:
 
 
 def default_mappings() -> list:
+    """The true built-in default: nothing. This tool does nothing until
+    you configure it -- see EXAMPLE_MAPPINGS and `config example`/`config add`."""
+    return []
+
+
+def example_mappings() -> list:
+    """Reference example (Firefox + Chromium), used only to seed a starter
+    config via `config example`. Never used as an actual runtime default."""
     home = Path.home()
     return [
         Mapping(
@@ -77,6 +87,25 @@ def default_mappings() -> list:
             target=home / ".var/app/org.chromium.Chromium/config/chromium",
         ),
     ]
+
+
+def expand_path(raw: str) -> Path:
+    """
+    Expand ~ and $HOME / ${HOME} tokens in a config-provided path string,
+    so config files stay portable across machines/users rather than
+    hardcoding one user's literal home directory.
+
+    Uses Path.home() consistently for every form of expansion, rather
+    than mixing in os.path.expanduser() (which reads $HOME/the pwd
+    database directly and can silently disagree with Path.home() in
+    unusual environments, and doesn't respect test-time monkeypatching
+    of Path.home() either).
+    """
+    home = str(Path.home())
+    expanded = raw.replace("${HOME}", home).replace("$HOME", home)
+    if expanded == "~" or expanded.startswith("~/"):
+        expanded = home + expanded[1:]
+    return Path(expanded)
 
 
 SYSTEM_CONFIG_PATH = Path("/etc/subvolumize-home/flatpak-relink.json")
@@ -107,8 +136,8 @@ def _read_app_entries(path: Path):
         try:
             mappings.append(Mapping(
                 app_id=entry["app_id"],
-                source=Path(os.path.expanduser(entry["source"])),
-                target=Path(os.path.expanduser(entry["target"])),
+                source=expand_path(entry["source"]),
+                target=expand_path(entry["target"]),
             ))
         except (KeyError, TypeError) as exc:
             print(f"warning: skipping malformed entry in {path}: missing {exc}", file=sys.stderr)
@@ -158,14 +187,56 @@ def load_mappings(config_path: Optional[Path]) -> list:
     return list(merged.values())
 
 
-def cmd_write_default_config(args) -> None:
+def _config_target_path(args) -> Path:
+    """Resolve which file `config add`/`config example` should write to,
+    based on --global (system layer, requires root) vs the default
+    per-user layer, with --config as an explicit override of either."""
     if args.global_config:
         if os.geteuid() != 0:
             sys.exit(f"error: --global requires root (sudo), since it writes to {SYSTEM_CONFIG_PATH}")
-        path = SYSTEM_CONFIG_PATH
-    else:
-        path = args.config or user_config_path()
+        return args.config or SYSTEM_CONFIG_PATH
+    return args.config or user_config_path()
 
+
+def cmd_config_list(args) -> None:
+    mappings = load_mappings(args.config)
+    if not mappings:
+        print("(no app mappings configured)")
+        print("Run 'flatpak-relink-appdata config example' for a starter file, "
+              "or 'config add' to add one.")
+        return
+    for m in mappings:
+        print(f"{m.app_id}")
+        print(f"  source: {m.source}")
+        print(f"  target: {m.target}")
+
+
+def cmd_config_add(args) -> None:
+    path = _config_target_path(args)
+
+    entries = []
+    if path.exists():
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            sys.exit(f"error: {path} exists but isn't valid JSON: {exc}")
+        existing = data.get("app")
+        if isinstance(existing, list):
+            entries = existing
+
+    # "add" doubles as "add or update": replace any existing entry with
+    # the same app_id rather than creating a duplicate.
+    replaced = any(e.get("app_id") == args.app for e in entries)
+    entries = [e for e in entries if e.get("app_id") != args.app]
+    entries.append({"app_id": args.app, "source": args.src, "target": args.target})
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"app": entries}, indent=2) + "\n")
+    print(f"{'updated' if replaced else 'added'} {args.app} in {path}")
+
+
+def cmd_config_example(args) -> None:
+    path = _config_target_path(args)
     if path.exists():
         sys.exit(f"error: {path} already exists. Edit it directly, or remove it first to regenerate.")
 
@@ -178,15 +249,15 @@ def cmd_write_default_config(args) -> None:
                 "source": f"~/{m.source.relative_to(home)}" if home in m.source.parents else str(m.source),
                 "target": f"~/{m.target.relative_to(home)}" if home in m.target.parents else str(m.target),
             }
-            for m in default_mappings()
+            for m in example_mappings()
         ]
     }
     path.write_text(json.dumps(payload, indent=2) + "\n")
-    print(f"wrote default config to {path}")
+    print(f"wrote example config to {path}")
     if args.global_config:
         print("This is the system-wide baseline (/etc); per-user configs at "
               f"{user_config_path()} extend/override it by app_id, they don't replace it.")
-    print("Edit this file to add/remove app mappings.")
+    print("This is a reference example (Firefox + Chromium) -- edit app_id/source/target to match what you actually use.")
 
 
 def log(message: str) -> None:
@@ -338,21 +409,9 @@ def main() -> None:
         help="path to a flatpak-relink.json config file to use standalone, bypassing "
              f"the normal layered lookup ({SYSTEM_CONFIG_PATH}, then {user_config_path()})",
     )
-    parser.add_argument(
-        "--write-default-config",
-        action="store_true",
-        help="write the built-in default app mappings to a config file and exit "
-             "(per-user location by default; see --global)",
-    )
-    parser.add_argument(
-        "--global",
-        dest="global_config",
-        action="store_true",
-        help=f"with --write-default-config, write to {SYSTEM_CONFIG_PATH} instead "
-             "of the per-user location (requires root)",
-    )
 
     subparsers = parser.add_subparsers(dest="command")
+
     install_parser = subparsers.add_parser(
         "install",
         help="install this script (and optionally its login-time systemd unit)",
@@ -369,17 +428,57 @@ def main() -> None:
         help="also install and enable the systemd --user unit that runs this at login",
     )
 
+    config_parser = subparsers.add_parser("config", help="inspect or edit app mappings")
+    config_parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="target/inspect this specific file instead of the default per-scope location",
+    )
+    config_sub = config_parser.add_subparsers(dest="config_command")
+
+    config_sub.add_parser("list", help="show the effective (merged) app mappings")
+
+    add_parser = config_sub.add_parser("add", help="add or update one app mapping")
+    add_parser.add_argument("--app", required=True, help="flatpak app ID, e.g. org.mozilla.firefox")
+    add_parser.add_argument("--src", required=True, help="where the real data should live (~ allowed)")
+    add_parser.add_argument("--target", required=True, help="the .var/app/... path the app expects (~ allowed)")
+    add_parser.add_argument(
+        "--global", dest="global_config", action="store_true",
+        help=f"write to {SYSTEM_CONFIG_PATH} instead of the per-user location (requires root)",
+    )
+
+    example_parser = config_sub.add_parser("example", help="write a starter config with reference examples")
+    example_parser.add_argument(
+        "--global", dest="global_config", action="store_true",
+        help=f"write to {SYSTEM_CONFIG_PATH} instead of the per-user location (requires root)",
+    )
+
     args = parser.parse_args()
 
     if args.command == "install":
         cmd_install(args)
         return
 
-    if args.write_default_config:
-        cmd_write_default_config(args)
+    if args.command == "config":
+        if args.config_command == "list":
+            cmd_config_list(args)
+        elif args.config_command == "add":
+            cmd_config_add(args)
+        elif args.config_command == "example":
+            cmd_config_example(args)
+        else:
+            config_parser.print_help()
         return
 
-    for mapping in load_mappings(args.config):
+    mappings = load_mappings(args.config)
+    if not mappings:
+        print("No app mappings configured -- nothing to do.")
+        print("Run 'flatpak-relink-appdata config example' for a starter file, "
+              "or 'config add' to add one.")
+        return
+
+    for mapping in mappings:
         reconcile_one(mapping)
 
 

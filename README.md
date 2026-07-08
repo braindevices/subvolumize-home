@@ -17,6 +17,8 @@ mainly).
   automatically at every login.
 
 Use one or both independently -- they don't depend on each other.
+`flatpak-relink-appdata` does nothing at all until you configure it
+(see below) -- it ships with no assumptions about which apps you use.
 
 ## Before you run this on your own data
 
@@ -54,14 +56,33 @@ No dependencies beyond the Python standard library, no version
 requirement beyond Python 3.8+. `subvolumize-home` additionally needs
 Linux with `btrfs-progs` and `findmnt` installed.
 
+## Command shape
+
+Both tools follow the same convention throughout: subcommands are
+verbs (`config list`, `config add`, `install`), flags modify a verb's
+behavior (`--global`, `--config PATH`) rather than being actions
+themselves.
+
+```
+<tool>                       # do the thing (convert paths / reconcile app data)
+<tool> config list           # show the effective, merged configuration
+<tool> config add ...        # add or update one entry
+<tool> config example        # write a starter file with reference examples
+<tool> install [--service]   # install this tool (and optionally its login unit)
+```
+
+Add `--global` to `config add`, `config example`, or `install` to
+target the system-wide layer (`/etc/...`) instead of the per-user one
+-- requires root either way, since it's a shared system directory.
+
 ## subvolumize-home usage
 
 ```bash
-subvolumize-home --list                       # see the effective path list
 subvolumize-home --dry-run                    # preview, no changes
 subvolumize-home                              # interactive, asks per path
 subvolumize-home --yes                        # no prompts
 subvolumize-home --paths .cache .npm --yes    # only these two, ignoring config
+subvolumize-home config list                  # see the effective path list
 ```
 
 ### Configuring which paths get converted
@@ -81,8 +102,9 @@ creates their own `~/.config` file -- it extends the baseline, it
 doesn't replace it.
 
 ```bash
-subvolumize-home --write-default-config          # bootstrap ~/.config/...
-sudo subvolumize-home --write-default-config --global   # bootstrap /etc/...
+subvolumize-home config example                 # bootstrap ~/.config/... with the defaults
+sudo subvolumize-home config example --global    # bootstrap /etc/...
+subvolumize-home config add my-custom-cache-dir  # add one or more paths
 ```
 
 Either file looks like:
@@ -92,20 +114,33 @@ Either file looks like:
 }
 ```
 
+Entries accept `~`, `$HOME`, and `${HOME}` (all expand to the actual
+user's home at load time, not write time) as well as genuinely absolute
+paths -- useful for the `/etc` system-wide layer especially, since that
+one file is shared across every user's differently-located home
+directory. Plain relative entries like `.cache` keep working exactly as
+before. `config list` shows the resolved form alongside the raw entry
+whenever expansion changes it, e.g. `~/.cache -> /home/alice/.cache`.
+
 Pass `--config /some/other/path.json` to bypass layering entirely and
 use exactly that one file, standalone -- the same way `--paths` already
 works as a full override.
 
 ## flatpak-relink-appdata usage
 
-Same layering model, but merged **by `app_id`** instead of as a flat
-list: a higher layer redefining an `app_id` already known to a lower
-layer replaces that app's `source`/`target`; a new `app_id` is simply
-added alongside the rest.
+The true built-in default is **empty** -- this tool does nothing until
+you configure it. Same layering model as above, but merged **by
+`app_id`** instead of as a flat list: a higher layer redefining an
+`app_id` already known to a lower layer replaces that app's
+`source`/`target`; a new `app_id` is simply added alongside the rest.
 
 ```bash
-flatpak-relink-appdata --write-default-config
-sudo flatpak-relink-appdata --write-default-config --global
+flatpak-relink-appdata config example            # starter file with Firefox + Chromium examples
+flatpak-relink-appdata config add \
+  --app org.mozilla.firefox \
+  --src "~/AppData/firefox-profile" \
+  --target "~/.var/app/org.mozilla.firefox/.mozilla/firefox"
+flatpak-relink-appdata config list                # see the effective app mappings
 ```
 
 ```json
@@ -115,11 +150,6 @@ sudo flatpak-relink-appdata --write-default-config --global
       "app_id": "org.mozilla.firefox",
       "source": "~/AppData/firefox-profile",
       "target": "~/.var/app/org.mozilla.firefox/.mozilla/firefox"
-    },
-    {
-      "app_id": "org.chromium.Chromium",
-      "source": "~/AppData/chromium-profile",
-      "target": "~/.var/app/org.chromium.Chromium/config/chromium"
     }
   ]
 }
@@ -127,9 +157,12 @@ sudo flatpak-relink-appdata --write-default-config --global
 
 `source` is where the real data should live (inside your normal,
 snapshotted home tree); `target` is the `.var/app/...` path the app
-actually expects. `~` is expanded to `$HOME` in both fields. Run once by
-hand to do the first-time migration, or let the login service do it
-(below).
+actually expects. `~`, `$HOME`, and `${HOME}` all expand to the actual
+user's home at load time (not write time), so the same config file
+stays portable across machines and users. `config add` doubles as "add
+or update" -- re-adding an existing `app_id` replaces its
+source/target rather than duplicating the entry. Run once by hand to
+do the first-time migration, or let the login service do it (below).
 
 ## Running either tool automatically at login
 
@@ -152,16 +185,12 @@ sudo flatpak-relink-appdata install --global --service
 Drop `--service` from either command if you just want the binary
 installed without the login-time automation.
 
-(Note: `install --global` and `--write-default-config --global` are
-two independent `--global` flags scoped to their own subcommand/flag --
-one installs the binary+unit system-wide, the other writes the
-system-wide config layer. Combine as needed.)
-
 ## Running the tests
 
 ```bash
 pip install -e '.[dev]'
-pytest
+pytest      # tests
+ruff check .  # lint
 ```
 
 Tests mock out the actual `btrfs`/`findmnt`/`flatpak`/`systemctl` calls

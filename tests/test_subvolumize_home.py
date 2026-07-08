@@ -266,7 +266,7 @@ def test_load_volatile_paths_layering_user_extends_system_and_builtin(tmp_path, 
 def test_write_default_config_creates_file(tmp_path):
     config = tmp_path / "subdir" / "paths.json"
     args = SimpleNamespace(config=config, global_config=False)
-    svh.cmd_write_default_config(args)
+    svh.cmd_config_example(args)
     assert config.exists()
     loaded = svh.load_volatile_paths(config)
     assert loaded == svh.DEFAULT_VOLATILE_PATHS
@@ -277,14 +277,123 @@ def test_write_default_config_refuses_to_overwrite(tmp_path):
     config.write_text("{}")
     args = SimpleNamespace(config=config, global_config=False)
     with pytest.raises(SystemExit, match="already exists"):
-        svh.cmd_write_default_config(args)
+        svh.cmd_config_example(args)
 
 
 def test_write_default_config_global_requires_root(monkeypatch):
     monkeypatch.setattr(os, "geteuid", lambda: 1000)
     args = SimpleNamespace(config=None, global_config=True)
     with pytest.raises(SystemExit, match="requires root"):
-        svh.cmd_write_default_config(args)
+        svh.cmd_config_example(args)
+
+
+def test_config_add_creates_new_file(tmp_path):
+    config = tmp_path / "paths.json"
+    args = SimpleNamespace(config=config, global_config=False, path=["foo", "bar"])
+    svh.cmd_config_add(args)
+    loaded = svh.load_volatile_paths(config)
+    assert loaded == ["foo", "bar"]
+
+
+def test_config_add_appends_to_existing_file(tmp_path):
+    config = tmp_path / "paths.json"
+    config.write_text('{"paths": ["existing"]}')
+    args = SimpleNamespace(config=config, global_config=False, path=["new-one"])
+    svh.cmd_config_add(args)
+    loaded = svh.load_volatile_paths(config)
+    assert loaded == ["existing", "new-one"]
+
+
+def test_config_add_skips_duplicates(tmp_path, capsys):
+    config = tmp_path / "paths.json"
+    config.write_text('{"paths": ["already-there"]}')
+    args = SimpleNamespace(config=config, global_config=False, path=["already-there"])
+    svh.cmd_config_add(args)
+    loaded = svh.load_volatile_paths(config)
+    assert loaded == ["already-there"]  # no duplicate
+    assert "no changes" in capsys.readouterr().out
+
+
+def test_config_add_global_requires_root(monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    args = SimpleNamespace(config=None, global_config=True, path=["foo"])
+    with pytest.raises(SystemExit, match="requires root"):
+        svh.cmd_config_add(args)
+
+
+def test_expand_path_str_plain_relative_unchanged(monkeypatch, tmp_path):
+    monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
+    assert svh.expand_path_str(".cache") == ".cache"
+
+
+def test_expand_path_str_tilde(monkeypatch, tmp_path):
+    monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
+    assert svh.expand_path_str("~/.cache") == str(tmp_path / ".cache")
+
+
+def test_expand_path_str_curly_home_var(monkeypatch, tmp_path):
+    monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
+    assert svh.expand_path_str("${HOME}/.cache") == str(tmp_path / ".cache")
+
+
+def test_expand_path_str_bare_home_var(monkeypatch, tmp_path):
+    monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
+    assert svh.expand_path_str("$HOME/.cache") == str(tmp_path / ".cache")
+
+
+def test_expand_path_str_absolute_path_unaffected(monkeypatch, tmp_path):
+    monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
+    assert svh.expand_path_str("/mnt/external/cache") == "/mnt/external/cache"
+
+
+def test_resolve_targets_mixed_forms(tmp_path, monkeypatch):
+    monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
+    home = tmp_path
+    targets = [".cache", "~/.npm", "${HOME}/.cargo", "/mnt/external/backup"]
+    result = svh.resolve_targets(targets, home)
+    assert result == [
+        str(home / ".cache"),
+        str(home / ".npm"),
+        str(home / ".cargo"),
+        "/mnt/external/backup",
+    ]
+
+
+def test_resolve_targets_glob_after_expansion(tmp_path, monkeypatch):
+    monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
+    home = tmp_path
+    (home / ".var" / "app" / "app1").mkdir(parents=True)
+    (home / ".var" / "app" / "app2").mkdir(parents=True)
+    result = svh.resolve_targets(["${HOME}/.var/app/*"], home)
+    assert sorted(result) == sorted([
+        str(home / ".var" / "app" / "app1"),
+        str(home / ".var" / "app" / "app2"),
+    ])
+
+
+def test_resolve_targets_glob_matching_nothing_is_skipped(tmp_path, capsys):
+    home = tmp_path
+    result = svh.resolve_targets(["nonexistent/*"], home)
+    assert result == []
+    assert "matched nothing" in capsys.readouterr().out
+
+
+def test_config_list_shows_resolved_form_when_expanded(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
+    config = tmp_path / "paths.json"
+    config.write_text('{"paths": ["~/.cache"]}')
+    args = SimpleNamespace(config=config)
+    svh.cmd_config_list(args)
+    out = capsys.readouterr().out
+    assert f"~/.cache -> {tmp_path / '.cache'}" in out
+
+
+def test_config_list_prints_effective_paths(tmp_path, capsys):
+    config = tmp_path / "paths.json"
+    args = SimpleNamespace(config=config)
+    svh.cmd_config_list(args)
+    out = capsys.readouterr().out.splitlines()
+    assert out == svh.DEFAULT_VOLATILE_PATHS  # config doesn't exist -> falls back to builtin
 
 
 def test_install_per_user_copies_self(tmp_path, monkeypatch):

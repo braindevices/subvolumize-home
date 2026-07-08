@@ -30,7 +30,9 @@ Usage
     ./subvolumize_home.py                    # interactive, asks per path
     ./subvolumize_home.py --yes              # no prompts
     ./subvolumize_home.py --paths .cache .npm --yes
-    ./subvolumize_home.py --list             # show the default path list
+    ./subvolumize_home.py config list        # show the effective path list
+    ./subvolumize_home.py config add .cache  # add a path to your config
+    ./subvolumize_home.py config example     # write a starter config file
 """
 
 import argparse
@@ -142,6 +144,26 @@ DEFAULT_VOLATILE_PATHS = [
 # ---------------------------------------------------------------------------
 
 
+def expand_path_str(raw: str) -> str:
+    """
+    Expand ~ and $HOME / ${HOME} tokens in a config-provided path string,
+    so config files stay portable across machines/users rather than
+    hardcoding one user's literal home directory. Plain relative entries
+    like ".cache" (no ~ or $HOME) pass through unchanged.
+
+    Uses Path.home() consistently for every form of expansion, rather
+    than mixing in os.path.expanduser() (which reads $HOME/the pwd
+    database directly and can silently disagree with Path.home() in
+    unusual environments, and doesn't respect test-time monkeypatching
+    of Path.home() either).
+    """
+    home = str(Path.home())
+    expanded = raw.replace("${HOME}", home).replace("$HOME", home)
+    if expanded == "~" or expanded.startswith("~/"):
+        expanded = home + expanded[1:]
+    return expanded
+
+
 SYSTEM_CONFIG_PATH = Path("/etc/subvolumize-home/paths.json")
 
 
@@ -203,21 +225,62 @@ def load_volatile_paths(config_path: Optional[Path]) -> list:
     return result
 
 
-def cmd_write_default_config(args) -> None:
+def _config_target_path(args) -> Path:
+    """Resolve which file `config add`/`config example` should write to,
+    based on --global (system layer, requires root) vs the default
+    per-user layer, with --config as an explicit override of either."""
     if args.global_config:
         if os.geteuid() != 0:
             sys.exit(f"error: --global requires root (sudo), since it writes to {SYSTEM_CONFIG_PATH}")
-        path = SYSTEM_CONFIG_PATH
-    else:
-        path = args.config or user_config_path()
+        return args.config or SYSTEM_CONFIG_PATH
+    return args.config or user_config_path()
 
+
+def cmd_config_list(args) -> None:
+    for entry in load_volatile_paths(args.config):
+        resolved = expand_path_str(entry)
+        if resolved != entry:
+            print(f"{entry} -> {resolved}")
+        else:
+            print(entry)
+
+
+def cmd_config_add(args) -> None:
+    path = _config_target_path(args)
+
+    paths = []
+    if path.exists():
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            sys.exit(f"error: {path} exists but isn't valid JSON: {exc}")
+        existing = data.get("paths")
+        if isinstance(existing, list):
+            paths = existing
+
+    added = []
+    for p in args.path:
+        if p not in paths:
+            paths.append(p)
+            added.append(p)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"paths": paths}, indent=2) + "\n")
+    if added:
+        print(f"added {', '.join(added)} to {path}")
+    else:
+        print(f"no changes: all given path(s) already present in {path}")
+
+
+def cmd_config_example(args) -> None:
+    path = _config_target_path(args)
     if path.exists():
         sys.exit(f"error: {path} already exists. Edit it directly, or remove it first to regenerate.")
 
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"paths": DEFAULT_VOLATILE_PATHS}
     path.write_text(json.dumps(payload, indent=2) + "\n")
-    print(f"wrote default config to {path}")
+    print(f"wrote example config to {path}")
     if args.global_config:
         print("This is the system-wide baseline (/etc); per-user configs at "
               f"{user_config_path()} extend it, they don't replace it.")
@@ -429,12 +492,35 @@ def cmd_install(args) -> None:
         print("enabled and started for the current user")
 
 
-def cmd_convert(args) -> None:
-    if args.list:
-        for p in load_volatile_paths(args.config):
-            print(p)
-        return
+def resolve_targets(targets: list, home: Path) -> list:
+    """
+    Expand ~ / $HOME / ${HOME} tokens in each target entry, then resolve
+    glob patterns (e.g. ".var/app/*/cache") -- relative to $HOME for
+    entries that stay relative, or as-is for entries that expanded to
+    (or already were) an absolute path. Returns the flat list of concrete
+    path strings to actually process; glob patterns matching nothing are
+    reported and dropped.
+    """
+    resolved = []
+    for entry in targets:
+        expanded_entry = expand_path_str(entry)
+        if Path(expanded_entry).is_absolute():
+            base = expanded_entry
+        else:
+            base = str(home / expanded_entry)
 
+        if any(ch in base for ch in "*?["):
+            matches = sorted(globmod.glob(base))
+            if not matches:
+                print(f"[skip] glob {entry!r} matched nothing")
+                continue
+            resolved.extend(matches)
+        else:
+            resolved.append(base)
+    return resolved
+
+
+def cmd_convert(args) -> None:
     require_tool("findmnt")
     require_tool("btrfs")
 
@@ -453,18 +539,7 @@ def cmd_convert(args) -> None:
               f"(it may be a plain directory inside a larger subvolume). Continuing anyway.")
 
     targets = args.paths if args.paths else load_volatile_paths(args.config)
-
-    # expand any glob patterns (e.g. ".var/app/*/cache") relative to $HOME
-    expanded = []
-    for rel in targets:
-        if any(ch in rel for ch in "*?["):
-            matches = sorted(globmod.glob(str(home / rel)))
-            if not matches:
-                print(f"[skip] glob {rel!r} matched nothing")
-                continue
-            expanded.extend(matches)
-        else:
-            expanded.append(str(home / rel))
+    expanded = resolve_targets(targets, home)
 
     successes, failures = [], []
     for raw in expanded:
@@ -502,7 +577,6 @@ def main():
         default=None,
         help="paths relative to $HOME to convert (default: a built-in list of common cache/volatile dirs)",
     )
-    parser.add_argument("--list", action="store_true", help="print the effective path list and exit")
     parser.add_argument("--dry-run", action="store_true", help="show what would happen, change nothing")
     parser.add_argument("--yes", action="store_true", help="do not prompt for confirmation before each conversion")
     parser.add_argument(
@@ -512,21 +586,9 @@ def main():
         help="path to a paths.json config file to use standalone, bypassing "
              f"the normal layered lookup ({SYSTEM_CONFIG_PATH}, then {user_config_path()})",
     )
-    parser.add_argument(
-        "--write-default-config",
-        action="store_true",
-        help="write the built-in default path list to a config file and exit "
-             "(per-user location by default; see --global)",
-    )
-    parser.add_argument(
-        "--global",
-        dest="global_config",
-        action="store_true",
-        help=f"with --write-default-config, write to {SYSTEM_CONFIG_PATH} instead "
-             "of the per-user location (requires root)",
-    )
 
     subparsers = parser.add_subparsers(dest="command")
+
     install_parser = subparsers.add_parser(
         "install",
         help="install this script (and optionally its login-time systemd unit)",
@@ -543,14 +605,45 @@ def main():
         help="also install and enable the systemd --user unit that runs this at login",
     )
 
+    config_parser = subparsers.add_parser("config", help="inspect or edit the path list")
+    config_parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="target/inspect this specific file instead of the default per-scope location",
+    )
+    config_sub = config_parser.add_subparsers(dest="config_command")
+
+    config_sub.add_parser("list", help="show the effective (merged) path list")
+
+    add_parser = config_sub.add_parser("add", help="add one or more paths")
+    add_parser.add_argument("path", nargs="+", help="path(s) relative to $HOME to add")
+    add_parser.add_argument(
+        "--global", dest="global_config", action="store_true",
+        help=f"write to {SYSTEM_CONFIG_PATH} instead of the per-user location (requires root)",
+    )
+
+    example_parser = config_sub.add_parser("example", help="write a starter config with the built-in defaults")
+    example_parser.add_argument(
+        "--global", dest="global_config", action="store_true",
+        help=f"write to {SYSTEM_CONFIG_PATH} instead of the per-user location (requires root)",
+    )
+
     args = parser.parse_args()
 
     if args.command == "install":
         cmd_install(args)
         return
 
-    if args.write_default_config:
-        cmd_write_default_config(args)
+    if args.command == "config":
+        if args.config_command == "list":
+            cmd_config_list(args)
+        elif args.config_command == "add":
+            cmd_config_add(args)
+        elif args.config_command == "example":
+            cmd_config_example(args)
+        else:
+            config_parser.print_help()
         return
 
     cmd_convert(args)
