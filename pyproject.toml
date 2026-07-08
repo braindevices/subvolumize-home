@@ -1,0 +1,46 @@
+[project]
+name = "subvolumize-home"
+version = "0.1.0"
+description = "Convert volatile home directories (caches, flatpak/snap data, build caches) into btrfs subvolumes so they're excluded from home-directory snapshots."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+    { name = "TODO: your name", email = "you@example.com" },
+]
+keywords = ["btrfs", "subvolume", "snapshot", "backup", "sysadmin"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Filesystems",
+    "Topic :: System :: Archiving :: Backup",
+]
+
+[project.urls]
+Homepage = "https://github.com/TODO/subvolumize-home"
+Issues = "https://github.com/TODO/subvolumize-home/issues"
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ruff>=0.6"]
+
+[project.scripts]
+subvolumize-home = "subvolumize_home:main"
+flatpak-relink-appdata = "flatpak_relink_appdata:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["subvolumize_home", "flatpak_relink_appdata"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py38"
