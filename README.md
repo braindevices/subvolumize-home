@@ -114,13 +114,16 @@ Either file looks like:
 }
 ```
 
-Entries accept `~`, `$HOME`, and `${HOME}` (all expand to the actual
-user's home at load time, not write time) as well as genuinely absolute
-paths -- useful for the `/etc` system-wide layer especially, since that
-one file is shared across every user's differently-located home
-directory. Plain relative entries like `.cache` keep working exactly as
-before. `config list` shows the resolved form alongside the raw entry
-whenever expansion changes it, e.g. `~/.cache -> /home/alice/.cache`.
+Entries must be plain paths relative to `$HOME` (like the examples
+above) -- `subvolumize-home` only ever touches things inside your home
+directory, so absolute paths and `~`/`$HOME`/`${HOME}` expansion are
+deliberately not supported here (unlike `flatpak-relink-appdata` below,
+where `source` can legitimately point anywhere, e.g. a backup drive).
+This is enforced consistently everywhere a path can enter a run --
+`config add`, `--paths`, and normal config loading all reject a
+non-relative entry immediately with a clear error, rather than
+silently accepting it only to skip it later once the tool is already
+running.
 
 Pass `--config /some/other/path.json` to bypass layering entirely and
 use exactly that one file, standalone -- the same way `--paths` already

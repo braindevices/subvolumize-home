@@ -144,27 +144,47 @@ DEFAULT_VOLATILE_PATHS = [
 # ---------------------------------------------------------------------------
 
 
-def expand_path_str(raw: str) -> str:
+def is_home_relative(entry: str) -> bool:
     """
-    Expand ~ and $HOME / ${HOME} tokens in a config-provided path string,
-    so config files stay portable across machines/users rather than
-    hardcoding one user's literal home directory. Plain relative entries
-    like ".cache" (no ~ or $HOME) pass through unchanged.
+    True if `entry` looks like a plain path relative to $HOME (e.g.
+    ".cache", ".var/app/*/cache") rather than an absolute path or one
+    using ~/$HOME/${HOME} expansion.
 
-    Uses Path.home() consistently for every form of expansion, rather
-    than mixing in os.path.expanduser() (which reads $HOME/the pwd
-    database directly and can silently disagree with Path.home() in
-    unusual environments, and doesn't respect test-time monkeypatching
-    of Path.home() either).
+    subvolumize-home only ever operates within the home directory --
+    unlike flatpak-relink-appdata's source/target (which can legitimately
+    point anywhere, e.g. a backup drive), every entry here is meant to be
+    "a subdirectory of $HOME", full stop. So unlike that tool, this one
+    deliberately does NOT support ~/$HOME expansion or absolute paths:
+    supporting them would just be an escape hatch for a model that
+    doesn't want one. A path that manages to sneak past this and still
+    resolves outside $HOME is still caught later regardless, at the
+    point paths are actually resolved (see cmd_convert) -- this check
+    exists to give a fast, clear error at config-edit time instead of a
+    silent skip much later.
     """
-    home = str(Path.home())
-    expanded = raw.replace("${HOME}", home).replace("$HOME", home)
-    if expanded == "~" or expanded.startswith("~/"):
-        expanded = home + expanded[1:]
-    return expanded
+    return not (entry.startswith("/") or entry.startswith("~") or "$HOME" in entry or "${HOME}" in entry)
+
+
+def reject_non_home_relative(entries: list) -> None:
+    """
+    Exit with a clear, whole-batch error if any entry isn't home-relative
+    (see is_home_relative). Used at every entry point that can introduce
+    paths into a run -- `config add`, `--paths`, and the normal
+    config-loading path -- so a bad entry is caught immediately and
+    loudly, the same way everywhere, rather than only via the much later
+    per-path "resolves outside $HOME" skip during actual conversion.
+    """
+    bad = [e for e in entries if not is_home_relative(e)]
+    if bad:
+        sys.exit(
+            "error: subvolumize-home only operates within $HOME, so entries must be plain "
+            "paths relative to it (e.g. \".cache\"), not absolute paths or ~/$HOME expansion.\n"
+            f"Rejected: {', '.join(bad)}"
+        )
 
 
 SYSTEM_CONFIG_PATH = Path("/etc/subvolumize-home/paths.json")
+
 
 
 def user_config_path() -> Path:
@@ -238,14 +258,12 @@ def _config_target_path(args) -> Path:
 
 def cmd_config_list(args) -> None:
     for entry in load_volatile_paths(args.config):
-        resolved = expand_path_str(entry)
-        if resolved != entry:
-            print(f"{entry} -> {resolved}")
-        else:
-            print(entry)
+        print(entry)
 
 
 def cmd_config_add(args) -> None:
+    reject_non_home_relative(args.path)
+
     path = _config_target_path(args)
 
     paths = []
@@ -494,21 +512,18 @@ def cmd_install(args) -> None:
 
 def resolve_targets(targets: list, home: Path) -> list:
     """
-    Expand ~ / $HOME / ${HOME} tokens in each target entry, then resolve
-    glob patterns (e.g. ".var/app/*/cache") -- relative to $HOME for
-    entries that stay relative, or as-is for entries that expanded to
-    (or already were) an absolute path. Returns the flat list of concrete
-    path strings to actually process; glob patterns matching nothing are
-    reported and dropped.
+    Resolve glob patterns (e.g. ".var/app/*/cache") relative to $HOME.
+
+    Every entry is always interpreted relative to $HOME -- this tool
+    only ever touches things inside the home directory, so unlike
+    flatpak-relink-appdata there's deliberately no ~/$HOME expansion or
+    absolute-path support here (see is_home_relative()). Returns the
+    flat list of concrete path strings to actually process; glob
+    patterns matching nothing are reported and dropped.
     """
     resolved = []
     for entry in targets:
-        expanded_entry = expand_path_str(entry)
-        if Path(expanded_entry).is_absolute():
-            base = expanded_entry
-        else:
-            base = str(home / expanded_entry)
-
+        base = str(home / entry)
         if any(ch in base for ch in "*?["):
             matches = sorted(globmod.glob(base))
             if not matches:
@@ -521,6 +536,9 @@ def resolve_targets(targets: list, home: Path) -> list:
 
 
 def cmd_convert(args) -> None:
+    targets = args.paths if args.paths else load_volatile_paths(args.config)
+    reject_non_home_relative(targets)
+
     require_tool("findmnt")
     require_tool("btrfs")
 
@@ -538,7 +556,6 @@ def cmd_convert(args) -> None:
         print(f"Warning: {home} is on btrfs but is not itself a subvolume root "
               f"(it may be a plain directory inside a larger subvolume). Continuing anyway.")
 
-    targets = args.paths if args.paths else load_volatile_paths(args.config)
     expanded = resolve_targets(targets, home)
 
     successes, failures = [], []

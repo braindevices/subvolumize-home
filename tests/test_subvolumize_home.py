@@ -321,50 +321,37 @@ def test_config_add_global_requires_root(monkeypatch):
         svh.cmd_config_add(args)
 
 
-def test_expand_path_str_plain_relative_unchanged(monkeypatch, tmp_path):
-    monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
-    assert svh.expand_path_str(".cache") == ".cache"
+def test_is_home_relative_plain_path(tmp_path):
+    assert svh.is_home_relative(".cache") is True
+    assert svh.is_home_relative(".var/app/*/cache") is True
 
 
-def test_expand_path_str_tilde(monkeypatch, tmp_path):
-    monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
-    assert svh.expand_path_str("~/.cache") == str(tmp_path / ".cache")
+def test_is_home_relative_rejects_absolute(tmp_path):
+    assert svh.is_home_relative("/mnt/external/cache") is False
 
 
-def test_expand_path_str_curly_home_var(monkeypatch, tmp_path):
-    monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
-    assert svh.expand_path_str("${HOME}/.cache") == str(tmp_path / ".cache")
+def test_is_home_relative_rejects_tilde(tmp_path):
+    assert svh.is_home_relative("~/.cache") is False
+    assert svh.is_home_relative("~") is False
 
 
-def test_expand_path_str_bare_home_var(monkeypatch, tmp_path):
-    monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
-    assert svh.expand_path_str("$HOME/.cache") == str(tmp_path / ".cache")
+def test_is_home_relative_rejects_home_var(tmp_path):
+    assert svh.is_home_relative("$HOME/.cache") is False
+    assert svh.is_home_relative("${HOME}/.cache") is False
 
 
-def test_expand_path_str_absolute_path_unaffected(monkeypatch, tmp_path):
-    monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
-    assert svh.expand_path_str("/mnt/external/cache") == "/mnt/external/cache"
-
-
-def test_resolve_targets_mixed_forms(tmp_path, monkeypatch):
-    monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
+def test_resolve_targets_plain_relative(tmp_path):
     home = tmp_path
-    targets = [".cache", "~/.npm", "${HOME}/.cargo", "/mnt/external/backup"]
+    targets = [".cache", ".npm"]
     result = svh.resolve_targets(targets, home)
-    assert result == [
-        str(home / ".cache"),
-        str(home / ".npm"),
-        str(home / ".cargo"),
-        "/mnt/external/backup",
-    ]
+    assert result == [str(home / ".cache"), str(home / ".npm")]
 
 
-def test_resolve_targets_glob_after_expansion(tmp_path, monkeypatch):
-    monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
+def test_resolve_targets_glob(tmp_path):
     home = tmp_path
     (home / ".var" / "app" / "app1").mkdir(parents=True)
     (home / ".var" / "app" / "app2").mkdir(parents=True)
-    result = svh.resolve_targets(["${HOME}/.var/app/*"], home)
+    result = svh.resolve_targets([".var/app/*"], home)
     assert sorted(result) == sorted([
         str(home / ".var" / "app" / "app1"),
         str(home / ".var" / "app" / "app2"),
@@ -378,14 +365,70 @@ def test_resolve_targets_glob_matching_nothing_is_skipped(tmp_path, capsys):
     assert "matched nothing" in capsys.readouterr().out
 
 
-def test_config_list_shows_resolved_form_when_expanded(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
+def test_reject_non_home_relative_passes_valid_entries():
+    svh.reject_non_home_relative([".cache", ".npm"])  # should not raise
+
+
+def test_reject_non_home_relative_rejects_absolute():
+    with pytest.raises(SystemExit, match="only operates within \\$HOME"):
+        svh.reject_non_home_relative([".cache", "/etc/bad"])
+
+
+def test_reject_non_home_relative_rejects_tilde():
+    with pytest.raises(SystemExit, match="only operates within \\$HOME"):
+        svh.reject_non_home_relative(["~/.cache"])
+
+
+def test_reject_non_home_relative_reports_all_bad_entries():
+    try:
+        svh.reject_non_home_relative([".cache", "/bad1", "~/bad2", "$HOME/bad3"])
+        pytest.fail("should have exited")
+    except SystemExit as e:
+        assert "/bad1" in str(e)
+        assert "~/bad2" in str(e)
+        assert "$HOME/bad3" in str(e)
+        assert ".cache" not in str(e).split("Rejected:")[1]  # valid entry not listed as rejected
+
+
+def test_config_add_rejects_absolute_path(tmp_path):
     config = tmp_path / "paths.json"
-    config.write_text('{"paths": ["~/.cache"]}')
+    args = SimpleNamespace(config=config, global_config=False, path=["/mnt/external/cache"])
+    with pytest.raises(SystemExit, match="only operates within \\$HOME"):
+        svh.cmd_config_add(args)
+    assert not config.exists()
+
+
+def test_config_add_rejects_tilde(tmp_path):
+    config = tmp_path / "paths.json"
+    args = SimpleNamespace(config=config, global_config=False, path=["~/.cache"])
+    with pytest.raises(SystemExit, match="only operates within \\$HOME"):
+        svh.cmd_config_add(args)
+
+
+def test_config_add_rejects_home_var(tmp_path):
+    config = tmp_path / "paths.json"
+    args = SimpleNamespace(config=config, global_config=False, path=["$HOME/.cache"])
+    with pytest.raises(SystemExit, match="only operates within \\$HOME"):
+        svh.cmd_config_add(args)
+
+
+def test_config_add_mixed_valid_and_invalid_rejects_whole_batch(tmp_path):
+    """One bad entry in a multi-path `config add` call should reject the
+    whole batch rather than silently applying only the valid ones."""
+    config = tmp_path / "paths.json"
+    args = SimpleNamespace(config=config, global_config=False, path=[".cache", "/etc/bad"])
+    with pytest.raises(SystemExit, match="only operates within \\$HOME"):
+        svh.cmd_config_add(args)
+    assert not config.exists()
+
+
+def test_config_list_shows_plain_entries_no_expansion(tmp_path, capsys):
+    config = tmp_path / "paths.json"
+    config.write_text('{"paths": [".cache", "my-dir"]}')
     args = SimpleNamespace(config=config)
     svh.cmd_config_list(args)
-    out = capsys.readouterr().out
-    assert f"~/.cache -> {tmp_path / '.cache'}" in out
+    out = capsys.readouterr().out.splitlines()
+    assert out == [".cache", "my-dir"]
 
 
 def test_config_list_prints_effective_paths(tmp_path, capsys):
