@@ -4,16 +4,16 @@ version = "0.1.0"
 description = "Convert volatile home directories (caches, flatpak/snap data, build caches) into btrfs subvolumes so they're excluded from home-directory snapshots."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = { text = "GPL-3.0-or-later" }
 authors = [
-    { name = "TODO: your name", email = "you@example.com" },
+    { name = "Ling Wang", email = "LingWangNeuralEng@gmail.com" },
 ]
 keywords = ["btrfs", "subvolume", "snapshot", "backup", "sysadmin"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
     "Intended Audience :: System Administrators",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Topic :: System :: Filesystems",
@@ -21,8 +21,8 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/TODO/subvolumize-home"
-Issues = "https://github.com/TODO/subvolumize-home/issues"
+Homepage = "https://github.com/braindevices/subvolumize-home"
+Issues = "https://github.com/braindevices/subvolumize-home/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "ruff>=0.6"]

@@ -52,7 +52,7 @@ mounted); add the option in `/etc/fstab` if it's missing.
 Either tool works exactly the same way, dropped in raw with zero setup:
 
 ```bash
-curl -LO https://github.com/TODO/subvolumize-home/releases/latest/download/subvolumize_home.py
+curl -LO https://github.com/braindevices/subvolumize-home/releases/latest/download/subvolumize_home.py
 python3 subvolumize_home.py --dry-run
 ```
 
@@ -346,4 +346,4 @@ changing any of that.
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+GPL-3.0-or-later, see [LICENSE](LICENSE).
