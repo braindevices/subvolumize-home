@@ -1,10 +1,10 @@
 # Design
 
 Knowledge store for *why* this repo works the way it does. The code and
-docstrings say *what*; this document exists for the cross-cutting
-decisions that don't live in any one function, and the boundaries that
-were deliberately drawn and shouldn't be casually erased. See `tasks/*.plan.md`
-for the historical record of how each decision was reached.
+docstrings say *what*; this document is for the cross-cutting decisions
+that don't live in any one function, and the boundaries that are
+deliberately drawn and shouldn't be casually erased. This describes the
+current design only — for how a decision was reached, see `tasks/*.plan.md`.
 
 ## Two independent tools, one convention
 
@@ -19,8 +19,8 @@ both; neither depends on the other.
 They intentionally have **different trust models** (see below), because
 they solve different problems: one *creates* filesystem structure inside
 $HOME by default, the other *relocates* data the user explicitly points
-at, which can legitimately live anywhere (a backup drive). Don't try to
-unify their path-validation rules — the asymmetry is load-bearing.
+at, which can legitimately live anywhere (a backup drive). Don't unify
+their path-validation rules — the asymmetry is load-bearing.
 
 ---
 
@@ -28,23 +28,21 @@ unify their path-validation rules — the asymmetry is load-bearing.
 
 ### Safety model
 
-- **btrfs-only, checked per-target.** Originally a single upfront
-  `get_fstype(home)` gate; now every target is checked individually
-  (`check_target_is_btrfs`). Once targets can live outside `$HOME`
-  (`extra_roots`, `--sys-paths`, a followed symlink), each one may
-  legitimately sit on a different filesystem than `$HOME` or than each
-  other — one upfront check can't cover that. A non-btrfs target is a
-  **skip**, not a failure: it doesn't touch the run's exit code, matching
-  the other benign skip categories (symlink, not-a-directory,
-  already-a-subvolume, separate-mount-point, outside-scope).
-- **Never auto-create a missing target.** `convert_path` used to create
-  an empty subvolume for a target that didn't exist. Removed: if some
-  *ancestor* of the target is also missing (classic case — an external
-  drive whose mountpoint directory exists but isn't currently mounted),
-  `existing_ancestor`'s walk-up-to-something-real logic would find the
-  wrong filesystem (the one under the empty mountpoint dir) and silently
-  create the subvolume there instead of on the intended drive. A missing
-  target is now always a skip.
+- **btrfs-only, checked per-target.** `check_target_is_btrfs` checks
+  every target individually — home-relative paths, `extra_roots`-covered
+  absolute paths, `--sys-paths`, and symlink targets can each
+  legitimately live on a different filesystem, so no single upfront
+  check could cover all of them. A non-btrfs target is a **skip**, not
+  a failure: it doesn't touch the run's exit code, matching the other
+  benign skip categories (symlink, not-a-directory, already-a-subvolume,
+  separate-mount-point, outside-scope).
+- **Never auto-create a missing target.** A target that doesn't exist
+  yet is always a skip. Creating one would be dangerous specifically
+  when some *ancestor* of the target is also missing (e.g. an external
+  drive whose mountpoint directory exists but isn't currently mounted):
+  `existing_ancestor`'s walk-up-to-something-real logic would land the
+  new subvolume on whatever filesystem the nearest *existing* ancestor
+  actually sits on, not the one intended.
 - **Never delete data blindly.** Convert = rename original aside →
   create a fresh empty subvolume in its place → `cp -a --reflink=always
   -T` the backup's contents back in → restore original owner/mode →
@@ -63,25 +61,15 @@ unify their path-validation rules — the asymmetry is load-bearing.
   failure is caught and reported clearly rather than allowed to raise
   out of `convert_path` — it always returns a bool, never propagates an
   exception, and any rollback failure message says explicitly where the
-  original data safely still is (the untouched backup). Found via the
-  real-btrfs integration suite (see "Testing conventions" below):
-  mocking `run()` for `btrfs subvolume delete` meant nothing had ever
-  exercised what happens when that call itself fails.
+  original data safely still is (the untouched backup).
 - **`is_subvolume`** uses the inode-256 heuristic (every btrfs subvolume
   root has that reserved inode number) specifically to avoid needing
   `CAP_SYS_ADMIN`/root for `btrfs subvolume show`.
-- **The interactive confirmation prompt lives inside `convert_path`,
-  after every skip check, not in `cmd_convert` before any of them.**
-  It used to be the other way around — `cmd_convert` asked "Convert
-  X?" *before* calling `convert_path` at all, so it prompted for
-  targets that were never actually going to change (already a
-  subvolume, a symlink, missing, a separate mount point — any of
-  `convert_path`'s no-op/skip outcomes), regardless of the answer. The
-  prompt only makes sense once every one of those has already been
-  ruled out, i.e. immediately before the real rename/create/copy
-  sequence begins — so that's where it is now (`convert_path(path,
-  dry_run, confirm=not args.yes)`), and `cmd_convert` no longer prompts
-  at all itself.
+- **The interactive confirmation prompt lives inside `convert_path`**,
+  immediately before the real rename/create/copy sequence — after every
+  skip check (already a subvolume, symlink, missing, separate mount
+  point) has already ruled out a no-op. `convert_path(path, dry_run,
+  confirm=not args.yes)`; `cmd_convert` itself never prompts.
 
 ### The trust boundary: `paths` / `extra_roots` / `--sys-paths`
 
@@ -93,18 +81,15 @@ Three mechanisms, deliberately not one:
   *within* a configured `extra_roots` boundary to pass the scope check;
   otherwise it's just a validly-*shaped* entry pointing nowhere trusted.
 - **`extra_roots` is a pure trust boundary — never itself a conversion
-  target.** This was the opposite design originally (each `extra_roots`
-  entry was directly added to the conversion list, "just like a resolved
-  $HOME path"), and it was wrong: for a broad `extra_roots` entry to
-  usefully cover *any* symlink pointing somewhere under it, the entry has
-  to be an ancestor of the real target — but an ancestor that's *also*
-  independently converted conflicts with something nested inside it being
-  converted separately (redundant at best; at worst, incoherent at the
-  btrfs level, since you can't sensibly subvolume-ize a directory that
-  contains, or is about to contain, a separately-created nested
-  subvolume). Fix: `extra_roots` only ever feeds `is_within()`'s
-  `allowed_roots` list. If you want a specific absolute path directly
-  converted, it goes in `paths`.
+  target.** It only ever feeds `is_within()`'s `allowed_roots` list. A
+  broad `extra_roots` entry can cover *any* symlink pointing somewhere
+  under it precisely because it's never also independently converted —
+  an entry that was *also* a direct target would conflict with something
+  nested inside it being converted separately (redundant at best; at
+  worst, incoherent at the btrfs level, since you can't sensibly
+  subvolume-ize a directory that contains, or is about to contain, a
+  separately-created nested subvolume). If you want a specific absolute
+  path directly converted, it goes in `paths`.
 - **`--sys-paths`** is the deliberately **unguarded** escape hatch:
   absolute paths, no `$USER` requirement, bypasses the `is_within` scope
   check entirely, and — this is the important part — **can never be set
@@ -142,15 +127,14 @@ path"). Both layer the same way (system → user, extending, deduped), or
 
 Config *writers* (`cmd_config_add`, `cmd_config_add_extra_root`) go
 through `_load_config_dict`, which reads the whole file as a dict and
-only touches its own key — not because it's tidy, but because the
-earlier version always wrote `{"paths": [...]}` verbatim, silently
-deleting any `extra_roots` key a different command had written to the
-same file. Any future config-writing command must follow this pattern.
+only touches its own key, preserving whatever else is there — e.g.
+adding a `paths` entry must never clobber an existing `extra_roots` key
+in the same file. Any future config-writing command must follow this
+pattern.
 
 ### Copying: reflink, not rsync
 
-`copy_contents` uses `cp -a --reflink=always -T -- src dst`. Not
-`rsync -aHAX`, and not `--reflink=auto`:
+`copy_contents` uses `cp -a --reflink=always -T -- src dst`:
 
 - The backup and the freshly-created subvolume are *always* on the same
   btrfs filesystem by the time this runs (already established by
@@ -161,13 +145,12 @@ same file. Any future config-writing command must follow this pattern.
   possible, fail loudly (existing rollback handles it) rather than
   silently falling back to a real copy that would quietly defeat the
   entire point.
-- `-T`/`--no-target-directory` is what makes `cp` merge `src`'s contents
-  into an already-existing `dst`, matching the old `rsync src/ dst/`
-  trailing-slash trick.
-- There is **no fallback copy mechanism** (the old `shutil.copytree`
-  path is gone). `cp` is a far safer universal dependency than `rsync`,
-  and a `cp` that can't do `--reflink` is caught up front by
-  `require_tool` (below), not discovered mid-conversion.
+- `-T`/`--no-target-directory` makes `cp` merge `src`'s contents into
+  the already-existing `dst`, instead of nesting `src` a level deeper.
+- There is **no fallback copy mechanism**: `cp` is a far safer universal
+  dependency than `rsync` would be, and a `cp` that can't do `--reflink`
+  is caught up front by `require_tool` (below), not discovered
+  mid-conversion.
 
 ### External tool requirements aren't uniform on purpose
 
@@ -254,16 +237,20 @@ empty — this tool does nothing until configured, unlike
   (does `cp -a --reflink=always -T` actually preserve hard links, does
   the inode-256 heuristic hold on a real subvolume, does `/proc/mounts`
   parsing work against the kernel's real format, does rollback actually
-  restore data after a real rename/subvolume-create). See
+  restore data after a real rename/subvolume-create). Most of its tests
+  call `subvolumize_home` functions directly, in-process — the only way
+  to cleanly inject a controlled failure (e.g. the rollback test's
+  monkeypatched `copy_contents`) — plus a couple that invoke the script
+  as a real subprocess, the only way to verify real argparse wiring,
+  real process exit codes, and whether a genuinely separate process's
+  own `configure_logging()` call creates and populates the local log
+  file the way an actual run would. See
   `tasks/real-btrfs-ci-tests.plan.md` for the full CI setup.
 - **A mocked test must never depend on what's actually installed.** The
   `test` CI job's runner does *not* have `btrfs-progs` installed (only
-  `test-real-btrfs` does) — a mocked test that forgets to stub
-  `shutil.which`/`require_tool` and happens to pass locally (because
-  the dev machine has `btrfs`/`findmnt` on `PATH`) will fail in CI. This
-  bit real tests in this suite before being caught — verify by
-  temporarily hiding `btrfs`/`findmnt`/`cp` from `PATH` entirely and
-  re-running the mocked suite; it must still pass 100%.
+  `test-real-btrfs` does) — verify by temporarily hiding
+  `btrfs`/`findmnt`/`cp` from `PATH` entirely and re-running the mocked
+  suite; it must still pass 100%.
 - **Logging is global, mutable, module-level state** (Python's `logging`
   registry is a singleton keyed by name) — an autouse fixture
   (`_reset_audit_logging`) must clear both loggers' handlers *and*

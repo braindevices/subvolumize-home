@@ -72,7 +72,11 @@ from typing import Optional
 
 DEFAULT_VOLATILE_PATHS = [
     ".cache",
-    ".local/share/Trash",
+    ".local/share/Trash",  # if it currently has contents, expect harmless
+                           # "gvfsd-trash: Unsupported operation detected on
+                           # trash directory" warnings in the journal after
+                           # conversion (see note below) -- empty the trash
+                           # first if you'd rather not see them
     ".local/share/baloo",
     ".thumbnails",
     ".npm",
@@ -86,6 +90,24 @@ DEFAULT_VOLATILE_PATHS = [
               # on this being entirely out of your snapshots)
     "snap",   # same tradeoff as .var, see note below
 ]
+
+# --- .local/share/Trash: expect noisy-but-harmless journal warnings ------
+# Converting renames the directory aside, creates a fresh subvolume, then
+# `cp -a --reflink`s the contents back in -- every file that was already
+# in the trash gets a brand-new inode in the process (reflinked to the
+# same data, but a new directory entry in a new btrfs subvolume). If a
+# desktop's trash monitor (e.g. GNOME's gvfsd-trash) is watching that
+# directory live, seeing every file "recreated" in one burst doesn't match
+# the normal trash lifecycle it expects (a file moved in when trashed,
+# moved out when restored), so it logs a defensive warning:
+#   gvfsd-trash: *** Unsupported operation detected on trash directory
+#   A trash files/ directory should only have files linked or unlinked...
+# This is monitoring-side noise, not data loss -- the trashed files'
+# content and permissions are intact (cp -a preserves everything), and
+# the monitor resyncs on its own. If you'd rather not see it at all,
+# empty the trash before running the conversion -- there's nothing to
+# lose by doing that to files you were about to discard anyway.
+# ---------------------------------------------------------------------------
 
 # --- chezmoi note --------------------------------------------------------
 # Once a directory above becomes its own subvolume, most snapshot tools
