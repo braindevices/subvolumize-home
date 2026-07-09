@@ -284,6 +284,33 @@ sudo flatpak-relink-appdata install --global --service
 Drop `--service` from either command if you just want the binary
 installed without the login-time automation.
 
+## Logging (subvolumize-home)
+
+The systemd `--service` unit already gets its console output captured
+into the journal automatically; a manual interactive run didn't have
+any persistent record until now. `subvolumize-home` logs to two
+additional places, split by how sensitive the detail is -- both are on
+top of the normal console output, which is unchanged:
+
+- **syslog** (`/dev/log`, tagged `subvolumize-home`) -- `install`'s
+  actions (what got copied where, the systemd unit path, each
+  `systemctl` call and its exit code) and, per `convert`/default run,
+  one summary line (`convert: N ok/skipped/converted, M failed`).
+  Deliberately **no specific paths** here: this is meant to be visible
+  to a sysadmin across every user on a shared machine, and a user's
+  actual cache/app directory names (`.var/app/org.mozilla.firefox/...`,
+  a custom path someone added) reveal what they use their computer for,
+  not operational metadata.
+- **`~/.local/state/subvolumize-home/subvolumize-home.log`** (rotated,
+  capped at ~1MB/3 files) -- the full per-target detail: what got
+  converted, skipped, and why, including which specific paths failed.
+  Stays local to the user, since this is exactly the detail kept out of
+  syslog above.
+
+Both are best-effort: if there's no syslog daemon listening, or the log
+file can't be written (read-only home, disk full), that destination is
+silently skipped -- logging never blocks an actual conversion or install.
+
 ## Running the tests
 
 ```bash
@@ -296,6 +323,13 @@ Tests mock out the actual `btrfs`/`findmnt`/`flatpak`/`systemctl` calls
 (CI runners generally have none of these available) and instead verify
 each tool's decision logic, config loading/layering, and
 rollback/conflict behavior against plain directories.
+
+## Contributing
+
+See [`design.md`](design.md) for the design rationale behind the safety
+model, the `paths`/`extra_roots`/`--sys-paths` trust boundary, and other
+decisions that aren't obvious from the code alone -- read it before
+changing any of that.
 
 ## License
 

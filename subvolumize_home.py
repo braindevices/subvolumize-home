@@ -59,9 +59,12 @@ Usage
 import argparse
 import glob as globmod
 import json
+import logging
+import logging.handlers
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -514,6 +517,132 @@ def run(cmd, **kwargs):
     return subprocess.run(cmd, **kwargs)
 
 
+# --- audit logging --------------------------------------------------------
+#
+# Two destinations, split by sensitivity (see tasks/audit-logging.plan.md):
+#   audit_log  -> syslog: cmd_install actions (binary/unit paths, systemctl
+#                 calls) and cmd_convert's per-run summary -- counts only,
+#                 no specific target paths, so a fleet-wide sysadmin view
+#                 doesn't leak what any given user actually has on their
+#                 machine (app names, project directories, ...).
+#   paths_log  -> a local file under $HOME: the actual per-target
+#                 conversion narrative (what got converted/skipped/why),
+#                 which does reveal that kind of detail, so it stays local
+#                 to the user rather than flowing into a shared log.
+# Both also always echo to the console, so terminal output is unchanged
+# from plain print() -- these are additive, and best-effort: if a
+# destination isn't available (no syslog daemon, unwritable home), that
+# handler is silently skipped rather than blocking the tool's actual job.
+
+AUDIT_LOG_NAME = "subvolumize_home.audit"
+PATHS_LOG_NAME = "subvolumize_home.paths"
+
+audit_log = logging.getLogger(AUDIT_LOG_NAME)
+paths_log = logging.getLogger(PATHS_LOG_NAME)
+
+
+def local_log_path() -> Path:
+    """
+    Where per-target conversion detail is persisted: $XDG_STATE_HOME
+    (hardcoded to ~/.local/state, not read from the environment --
+    matching this file's existing convention for ~/.config, see
+    user_config_path()), not ~/.config (settings) or ~/.cache (an
+    actual cache dir this tool might itself convert).
+    """
+    return Path.home() / ".local" / "state" / "subvolumize-home" / "subvolumize-home.log"
+
+
+def _silence_handler_errors(handler: logging.Handler) -> logging.Handler:
+    """
+    Best-effort really means best-effort: a handler can fail not just at
+    construction (caught by the try/except in each _make_*_handler
+    below) but also later, on an individual emit() call -- e.g. /dev/log
+    accepts the initial connection but a send() still fails because
+    nothing is actually listening, or the local log file's disk fills
+    up mid-run. Python's logging module already prevents that from
+    propagating and breaking the actual conversion (Handler.emit()
+    catches it and calls handleError(), which is a no-op unless
+    interactive), but its *default* handleError() dumps a full
+    traceback to stderr, which is exactly the noisy, main-flow-
+    interrupting behavior audit logging is supposed to avoid. Overriding
+    it to a no-op keeps the failure silent, matching every other
+    best-effort fallback in this file.
+    """
+    handler.handleError = lambda record: None
+    return handler
+
+
+def _make_console_handler() -> logging.Handler:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    return handler
+
+
+def _make_syslog_handler() -> Optional[logging.Handler]:
+    """
+    Best-effort: None if /dev/log isn't reachable at all (e.g. a
+    minimal container with no syslog daemon) -- syslog is auxiliary,
+    never a reason to fail the actual job. Tries SOCK_DGRAM first, then
+    SOCK_STREAM: most systems' /dev/log wants the former, but some
+    (notably some journald configurations) require the latter.
+    """
+    for socktype in (socket.SOCK_DGRAM, socket.SOCK_STREAM):
+        try:
+            handler = logging.handlers.SysLogHandler(address="/dev/log", socktype=socktype)
+        except OSError:
+            continue
+        handler.setFormatter(logging.Formatter("subvolumize-home[%(process)d]: %(message)s"))
+        return _silence_handler_errors(handler)
+    return None
+
+
+def _make_local_file_handler() -> Optional[logging.Handler]:
+    """Best-effort: None if the log file/directory can't be created
+    (e.g. a read-only home), same reasoning as _make_syslog_handler."""
+    path = local_log_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(path, maxBytes=1_000_000, backupCount=2)
+    except OSError:
+        return None
+    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    return _silence_handler_errors(handler)
+
+
+_CONFIGURED_LOGGER_NAMES = set()
+
+
+def configure_logging() -> None:
+    """
+    Attach a console handler (always) and a best-effort persistent
+    handler (syslog for audit_log, a local file for paths_log) to each
+    logger, once. Safe to call repeatedly and from multiple entry
+    points (cmd_install, cmd_convert, and convert_path all call this at
+    their top) -- cheap after the first call.
+
+    Idempotency is tracked via _CONFIGURED_LOGGER_NAMES rather than by
+    checking `logger.handlers` for emptiness: something else (notably
+    pytest's own logging capture, which attaches its own handler
+    directly to any named logger for its own reporting, bypassing
+    propagation) can populate `.handlers` before this ever runs, which
+    would make an emptiness check wrongly conclude "already configured"
+    and silently skip attaching the real handlers.
+    """
+    for logger, name, extra_handler_factory in (
+        (audit_log, AUDIT_LOG_NAME, _make_syslog_handler),
+        (paths_log, PATHS_LOG_NAME, _make_local_file_handler),
+    ):
+        if name in _CONFIGURED_LOGGER_NAMES:
+            continue
+        _CONFIGURED_LOGGER_NAMES.add(name)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        logger.addHandler(_make_console_handler())
+        extra = extra_handler_factory()
+        if extra is not None:
+            logger.addHandler(extra)
+
+
 def require_tool(name: str, feature: Optional[str] = None, feature_flag: str = "--help") -> None:
     """
     Exit if `name` isn't on PATH at all -- or, when `feature` is given,
@@ -661,6 +790,7 @@ def copy_contents(src: Path, dst: Path):
 
 def convert_path(path: Path, dry_run: bool) -> bool:
     """Convert a single existing directory into a subvolume. Returns True on success/skip-ok."""
+    configure_logging()
     label = str(path)
 
     if not path.exists():
@@ -671,37 +801,37 @@ def convert_path(path: Path, dry_run: bool) -> bool:
         # subvolume on whatever filesystem the nearest existing
         # ancestor actually sits on (often the root filesystem under an
         # unmounted mountpoint), not the one the user actually intended.
-        print(f"[skip]   {label} does not exist, leaving alone")
+        paths_log.info(f"[skip]   {label} does not exist, leaving alone")
         return True
 
     if path.is_symlink():
-        print(f"[skip]   {label} is a symlink, leaving it alone")
+        paths_log.info(f"[skip]   {label} is a symlink, leaving it alone")
         return True
 
     if not path.is_dir():
-        print(f"[skip]   {label} exists but is not a directory, leaving it alone")
+        paths_log.info(f"[skip]   {label} exists but is not a directory, leaving it alone")
         return True
 
     if is_subvolume(path):
-        print(f"[ok]     {label} is already a btrfs subvolume")
+        paths_log.info(f"[ok]     {label} is already a btrfs subvolume")
         return True
 
     if not path_on_same_filesystem(path, path.parent):
-        print(f"[skip]   {label} is a separate mount point, leaving it alone")
+        paths_log.info(f"[skip]   {label} is a separate mount point, leaving it alone")
         return True
 
-    print(f"[convert] {label} -> subvolume")
+    paths_log.info(f"[convert] {label} -> subvolume")
     if dry_run:
-        print(f"  would rename {label} -> {label}.pre-subvol.bak")
-        print(f"  would create empty subvolume at {label}")
-        print("  would copy contents back from the backup")
-        print("  would restore original ownership/permissions")
-        print("  would remove the backup directory")
+        paths_log.info(f"  would rename {label} -> {label}.pre-subvol.bak")
+        paths_log.info(f"  would create empty subvolume at {label}")
+        paths_log.info("  would copy contents back from the backup")
+        paths_log.info("  would restore original ownership/permissions")
+        paths_log.info("  would remove the backup directory")
         return True
 
     backup = path.with_name(path.name + ".pre-subvol.bak")
     if backup.exists():
-        print(f"  ERROR: backup path {backup} already exists, refusing to overwrite. Skipping.")
+        paths_log.error(f"  ERROR: backup path {backup} already exists, refusing to overwrite. Skipping.")
         return False
 
     orig_stat = path.stat()
@@ -718,19 +848,19 @@ def convert_path(path: Path, dry_run: bool) -> bool:
         os.chmod(path, orig_stat.st_mode)
 
         shutil.rmtree(backup)
-        print(f"  done: {label} is now a subvolume, backup removed")
+        paths_log.info(f"  done: {label} is now a subvolume, backup removed")
         return True
 
     except Exception as exc:
-        print(f"  ERROR during conversion: {exc}")
-        print("  rolling back...")
+        paths_log.error(f"  ERROR during conversion: {exc}")
+        paths_log.info("  rolling back...")
         # remove the (possibly partially populated) subvolume, if it was created
         if is_subvolume(path):
             run(["btrfs", "subvolume", "delete", str(path)])
         elif path.exists():
             shutil.rmtree(path)
         os.rename(backup, path)
-        print(f"  rollback complete, {label} is unchanged")
+        paths_log.info(f"  rollback complete, {label} is unchanged")
         return False
 
 
@@ -787,10 +917,12 @@ def cmd_install(args) -> None:
         unit_dir = Path.home() / ".config/systemd/user"
         exec_path = "%h/.local/bin/subvolumize-home"
 
+    configure_logging()
+
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(self_path, dest)
     dest.chmod(0o755)
-    print(f"installed: {dest}")
+    audit_log.info(f"install: copied {self_path} -> {dest}")
 
     if not args.service:
         return
@@ -798,10 +930,11 @@ def cmd_install(args) -> None:
     unit_dir.mkdir(parents=True, exist_ok=True)
     unit_path = unit_dir / "subvolumize-home.service"
     unit_path.write_text(SERVICE_UNIT_TEMPLATE.format(exec_path=exec_path))
-    print(f"installed: {unit_path}")
+    audit_log.info(f"install: wrote systemd unit {unit_path}")
 
     if args.global_install:
         result = run(["systemctl", "--global", "enable", "subvolumize-home.service"])
+        audit_log.info(f"install: systemctl --global enable subvolumize-home.service (rc={result.returncode})")
         if result.returncode != 0:
             sys.exit(f"error enabling service: {result.stderr.strip()}")
         print("enabled globally for all users (present and future)")
@@ -809,8 +942,10 @@ def cmd_install(args) -> None:
         print("Already-logged-in users won't pick this up until their next login, or:")
         print("  systemctl --user daemon-reload && systemctl --user start subvolumize-home.service")
     else:
-        run(["systemctl", "--user", "daemon-reload"])
+        reload_result = run(["systemctl", "--user", "daemon-reload"])
+        audit_log.info(f"install: systemctl --user daemon-reload (rc={reload_result.returncode})")
         result = run(["systemctl", "--user", "enable", "--now", "subvolumize-home.service"])
+        audit_log.info(f"install: systemctl --user enable --now subvolumize-home.service (rc={result.returncode})")
         if result.returncode != 0:
             sys.exit(f"error enabling service: {result.stderr.strip()}")
         print("enabled and started for the current user")
@@ -827,13 +962,14 @@ def resolve_targets(targets: list, home: Path) -> list:
     flat list of concrete path strings to actually process; glob
     patterns matching nothing are reported and dropped.
     """
+    configure_logging()
     resolved = []
     for entry in targets:
         base = str(home / entry)
         if any(ch in base for ch in "*?["):
             matches = sorted(globmod.glob(base))
             if not matches:
-                print(f"[skip] glob {entry!r} matched nothing")
+                paths_log.info(f"[skip] glob {entry!r} matched nothing")
                 continue
             resolved.extend(matches)
         else:
@@ -847,12 +983,13 @@ def resolve_absolute_targets(entries: list) -> list:
     (extra_roots, sys_paths) -- no $HOME prefix is joined, entries are
     used as-is (after any $USER expansion the caller already did).
     """
+    configure_logging()
     resolved = []
     for entry in entries:
         if any(ch in entry for ch in "*?["):
             matches = sorted(globmod.glob(entry))
             if not matches:
-                print(f"[skip] glob {entry!r} matched nothing")
+                paths_log.info(f"[skip] glob {entry!r} matched nothing")
                 continue
             resolved.extend(matches)
         else:
@@ -893,14 +1030,16 @@ def check_target_is_btrfs(path: Path) -> bool:
     can legitimately be on a different filesystem, so there's no single
     upfront check that covers all of them (see cmd_convert).
     """
+    configure_logging()
     fstype = get_fstype(existing_ancestor(path))
     if fstype != "btrfs":
-        print(f"[skip]   {path} is on '{fstype}', not btrfs, refusing")
+        paths_log.info(f"[skip]   {path} is on '{fstype}', not btrfs, refusing")
         return False
     return True
 
 
 def cmd_convert(args) -> None:
+    configure_logging()
     paths_targets = args.paths if args.paths else load_volatile_paths(args.config)
     reject_invalid_paths_entries(paths_targets)
     home_relative_targets = [e for e in paths_targets if is_home_relative(e)]
@@ -921,16 +1060,16 @@ def cmd_convert(args) -> None:
 
     home = Path.home().resolve()
 
-    print(f"Home directory: {home}")
+    paths_log.info(f"Home directory: {home}")
     fstype = get_fstype(home)
     if fstype != "btrfs":
-        print(f"Warning: {home} is on '{fstype}', not btrfs. $HOME-relative targets will be "
+        paths_log.info(f"Warning: {home} is on '{fstype}', not btrfs. $HOME-relative targets will be "
               f"skipped individually below; this no longer aborts the whole run, since targets "
               f"outside $HOME (extra_roots, --sys-paths) may live on a different filesystem.")
     elif is_subvolume(home):
-        print(f"Confirmed: {home} is on btrfs and is itself a subvolume (as expected).")
+        paths_log.info(f"Confirmed: {home} is on btrfs and is itself a subvolume (as expected).")
     else:
-        print(f"Confirmed: {home} is on btrfs, but is not itself a subvolume root "
+        paths_log.info(f"Confirmed: {home} is on btrfs, but is not itself a subvolume root "
               f"(it may be a plain directory inside a larger subvolume). Continuing anyway.")
 
     # extra_roots is a pure trust boundary -- it is never itself a
@@ -949,7 +1088,7 @@ def cmd_convert(args) -> None:
     for raw, governed_flag in expanded:
         path = Path(raw).resolve()
         if governed_flag and not is_within(path, allowed_roots):
-            print(f"[skip] {raw} resolves outside of $HOME and configured extra_roots "
+            paths_log.info(f"[skip] {raw} resolves outside of $HOME and configured extra_roots "
                   f"({path}), refusing for safety")
             continue
 
@@ -959,21 +1098,26 @@ def cmd_convert(args) -> None:
         if not args.yes and not args.dry_run:
             answer = input(f"Convert {path}? [y/N] ").strip().lower()
             if answer != "y":
-                print(f"[skip] {path} (user declined)")
+                paths_log.info(f"[skip] {path} (user declined)")
                 continue
 
         ok = convert_path(path, args.dry_run)
         (successes if ok else failures).append(str(path))
-        print()
+        paths_log.info("")
 
-    print("Summary")
-    print("-------")
-    print(f"  ok/skipped/converted: {len(successes)}")
-    print(f"  failed:                {len(failures)}")
+    # Full detail (including which paths failed) stays local to the
+    # user's own log; syslog gets counts only -- see configure_logging's
+    # docstring / tasks/audit-logging.plan.md for why the split.
+    paths_log.info("Summary")
+    paths_log.info("-------")
+    paths_log.info(f"  ok/skipped/converted: {len(successes)}")
+    paths_log.info(f"  failed:                {len(failures)}")
     if failures:
-        print("  failures:")
+        paths_log.info("  failures:")
         for f in failures:
-            print(f"    - {f}")
+            paths_log.info(f"    - {f}")
+    audit_log.info(f"convert: {len(successes)} ok/skipped/converted, {len(failures)} failed")
+    if failures:
         sys.exit(1)
 
 

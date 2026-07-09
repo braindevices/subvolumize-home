@@ -12,6 +12,7 @@ behavior of btrfs itself.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
@@ -21,6 +22,46 @@ from types import SimpleNamespace
 import pytest
 
 import subvolumize_home as svh
+
+_REAL_MAKE_SYSLOG_HANDLER = svh._make_syslog_handler
+
+
+@pytest.fixture(autouse=True)
+def _reset_audit_logging(monkeypatch, tmp_path):
+    """
+    subvolumize_home's audit/paths loggers are module-level singletons
+    (Python's logging registry is inherently global), so state attached
+    to them in one test would otherwise leak into later ones -- e.g. a
+    console handler holding a stale reference to whatever sys.stdout
+    object was current when it was created, which capsys can no longer
+    see once it's moved on to the next test's capture buffer.
+
+    Reset both loggers' handlers *and* configure_logging()'s own
+    idempotency tracking before/after every test, so it re-creates
+    fresh handlers (bound to that test's current sys.stdout/Path.home())
+    each time it's needed -- clearing .handlers alone isn't enough,
+    since configure_logging() tracks "already configured" independently
+    (see its docstring for why: pytest's own logging capture can
+    populate .handlers before this code ever runs).
+
+    Also stubs out the syslog handler by default (so tests don't write
+    into the real system journal) and defaults Path.home() to this
+    test's own tmp_path (so the local log file handler doesn't write
+    into the real invoking user's actual home directory for any test
+    that doesn't already mock Path.home() itself -- a test that does is
+    unaffected, since its own monkeypatch.setattr call simply overrides
+    this default).
+    """
+    def _reset():
+        for name in (svh.AUDIT_LOG_NAME, svh.PATHS_LOG_NAME):
+            logging.getLogger(name).handlers.clear()
+        svh._CONFIGURED_LOGGER_NAMES.clear()
+
+    _reset()
+    monkeypatch.setattr(svh, "_make_syslog_handler", lambda: None)
+    monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
+    yield
+    _reset()
 
 
 @pytest.fixture
@@ -528,6 +569,146 @@ def test_get_fstype_exits_when_nothing_works(monkeypatch):
     monkeypatch.setattr(svh, "get_fstype_from_proc_mounts", lambda path: None)
     with pytest.raises(SystemExit, match="could not determine filesystem type"):
         svh.get_fstype(Path("/whatever"))
+
+
+def test_local_log_path_under_xdg_state_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
+    assert svh.local_log_path() == tmp_path / ".local" / "state" / "subvolumize-home" / "subvolumize-home.log"
+
+
+def test_make_console_handler_targets_stdout_with_bare_message_format():
+    handler = svh._make_console_handler()
+    assert isinstance(handler, logging.StreamHandler)
+    assert handler.stream is svh.sys.stdout
+    assert handler.formatter._fmt == "%(message)s"
+
+
+def test_make_syslog_handler_returns_none_when_dev_log_unreachable(monkeypatch):
+    # The autouse fixture stubs _make_syslog_handler globally (so tests
+    # don't write into the real journal) -- restore the real
+    # implementation here since this test exercises it directly.
+    monkeypatch.setattr(svh, "_make_syslog_handler", _REAL_MAKE_SYSLOG_HANDLER)
+
+    def fail(*a, **kw):
+        raise OSError("no such socket")
+
+    monkeypatch.setattr(svh.logging.handlers, "SysLogHandler", fail)
+    assert svh._make_syslog_handler() is None
+
+
+def test_make_syslog_handler_falls_back_to_stream_socket(monkeypatch):
+    monkeypatch.setattr(svh, "_make_syslog_handler", _REAL_MAKE_SYSLOG_HANDLER)
+    import socket as socket_module
+
+    calls = []
+
+    def fake_syslog_handler(address, socktype):
+        calls.append(socktype)
+        if socktype == socket_module.SOCK_DGRAM:
+            raise OSError("dgram not supported here")
+        return logging.NullHandler()
+
+    monkeypatch.setattr(svh.logging.handlers, "SysLogHandler", fake_syslog_handler)
+    handler = svh._make_syslog_handler()
+    assert handler is not None
+    assert calls == [socket_module.SOCK_DGRAM, socket_module.SOCK_STREAM]
+
+
+def test_make_local_file_handler_returns_none_on_unwritable_directory(tmp_path, monkeypatch):
+    monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
+
+    def fail_mkdir(self, **kwargs):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(Path, "mkdir", fail_mkdir)
+    assert svh._make_local_file_handler() is None
+
+
+def test_make_local_file_handler_creates_working_handler(tmp_path, monkeypatch):
+    monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
+    handler = svh._make_local_file_handler()
+    assert handler is not None
+    assert Path(handler.baseFilename) == svh.local_log_path()
+    assert svh.local_log_path().parent.is_dir()
+
+
+def test_configure_logging_attaches_console_handler_even_without_extras(monkeypatch):
+    monkeypatch.setattr(svh, "_make_syslog_handler", lambda: None)
+    monkeypatch.setattr(svh, "_make_local_file_handler", lambda: None)
+    svh.configure_logging()
+    assert any(isinstance(h, logging.StreamHandler) for h in svh.audit_log.handlers)
+    assert any(isinstance(h, logging.StreamHandler) for h in svh.paths_log.handlers)
+
+
+def test_configure_logging_is_idempotent(monkeypatch):
+    monkeypatch.setattr(svh, "_make_syslog_handler", lambda: None)
+    monkeypatch.setattr(svh, "_make_local_file_handler", lambda: None)
+    svh.configure_logging()
+    first_count = len(svh.audit_log.handlers)
+    svh.configure_logging()
+    assert len(svh.audit_log.handlers) == first_count
+
+
+def test_cmd_install_logs_actions_to_audit_log(tmp_path, monkeypatch):
+    monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(svh, "require_tool", lambda *a, **kw: None)
+    calls = []
+    monkeypatch.setattr(svh, "audit_log", SimpleNamespace(info=lambda msg: calls.append(msg)))
+    # configure_logging() would otherwise try (and fail) to attach real
+    # handlers to this fake logger -- mark it already-configured so it's
+    # left alone, matching the mock in place of it.
+    svh._CONFIGURED_LOGGER_NAMES.add(svh.AUDIT_LOG_NAME)
+
+    args = SimpleNamespace(global_install=False, service=False)
+    svh.cmd_install(args)
+
+    assert any("copied" in c and str(tmp_path) in c for c in calls)
+
+
+def test_cmd_install_logs_systemctl_calls_with_return_code(tmp_path, monkeypatch):
+    monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(svh, "require_tool", lambda *a, **kw: None)
+    monkeypatch.setattr(svh, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""))
+    calls = []
+    monkeypatch.setattr(svh, "audit_log", SimpleNamespace(info=lambda msg: calls.append(msg)))
+    svh._CONFIGURED_LOGGER_NAMES.add(svh.AUDIT_LOG_NAME)
+
+    args = SimpleNamespace(global_install=False, service=True)
+    svh.cmd_install(args)
+
+    assert any("daemon-reload" in c and "rc=0" in c for c in calls)
+    assert any("enable --now" in c and "rc=0" in c for c in calls)
+    assert any("wrote systemd unit" in c for c in calls)
+
+
+def test_cmd_convert_summary_to_audit_log_omits_specific_paths(tmp_path, monkeypatch, fake_btrfs_create):
+    """Per tasks/audit-logging.plan.md: failures are folded into a count
+    for syslog, not sent individually with their paths."""
+    monkeypatch.setattr(svh, "DEFAULT_VOLATILE_PATHS", [])
+    home = tmp_path / "alice"
+    home.mkdir()
+    good = home / "gooddir"
+    good.mkdir()
+    (good / "file.txt").write_text("data")
+
+    monkeypatch.setattr(svh.Path, "home", lambda: home)
+    monkeypatch.setattr(svh, "require_tool", lambda *a, **kw: None)
+    monkeypatch.setattr(svh, "get_fstype", lambda path: "btrfs")
+    monkeypatch.setattr(svh, "is_subvolume", lambda path: False)
+    monkeypatch.setattr(svh, "copy_contents", lambda src, dst: None)
+    audit_calls = []
+    monkeypatch.setattr(svh, "audit_log", SimpleNamespace(info=lambda msg: audit_calls.append(msg)))
+    svh._CONFIGURED_LOGGER_NAMES.add(svh.AUDIT_LOG_NAME)
+
+    args = SimpleNamespace(
+        paths=["gooddir"], extra_roots=None, sys_paths=None,
+        config=tmp_path / "no-such-config.json", dry_run=False, yes=True,
+    )
+    svh.cmd_convert(args)
+
+    assert len(audit_calls) == 1
+    assert audit_calls[0] == "convert: 1 ok/skipped/converted, 0 failed"
+    assert str(good) not in audit_calls[0]
 
 
 def test_is_subvolume_uses_inode_256(tmp_path):
