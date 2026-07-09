@@ -70,6 +70,18 @@ unify their path-validation rules — the asymmetry is load-bearing.
 - **`is_subvolume`** uses the inode-256 heuristic (every btrfs subvolume
   root has that reserved inode number) specifically to avoid needing
   `CAP_SYS_ADMIN`/root for `btrfs subvolume show`.
+- **The interactive confirmation prompt lives inside `convert_path`,
+  after every skip check, not in `cmd_convert` before any of them.**
+  It used to be the other way around — `cmd_convert` asked "Convert
+  X?" *before* calling `convert_path` at all, so it prompted for
+  targets that were never actually going to change (already a
+  subvolume, a symlink, missing, a separate mount point — any of
+  `convert_path`'s no-op/skip outcomes), regardless of the answer. The
+  prompt only makes sense once every one of those has already been
+  ruled out, i.e. immediately before the real rename/create/copy
+  sequence begins — so that's where it is now (`convert_path(path,
+  dry_run, confirm=not args.yes)`), and `cmd_convert` no longer prompts
+  at all itself.
 
 ### The trust boundary: `paths` / `extra_roots` / `--sys-paths`
 

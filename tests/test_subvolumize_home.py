@@ -192,6 +192,115 @@ def test_convert_path_dry_run_does_not_touch_filesystem(tmp_path, monkeypatch):
     assert (target / "data.txt").read_text() == "hello"
 
 
+def test_convert_path_confirm_not_asked_when_already_subvolume(tmp_path, monkeypatch):
+    """The confirmation prompt must only fire for a target that's
+    actually about to be converted -- not for one of convert_path's
+    other no-op/skip outcomes, which would prompt for a decision that
+    doesn't actually change anything."""
+    target = tmp_path / "already_subvol"
+    target.mkdir()
+    monkeypatch.setattr(svh, "is_subvolume", lambda path: path == target)
+
+    def fail_input(prompt):
+        raise AssertionError("should not prompt for an already-converted target")
+
+    monkeypatch.setattr(svh, "input", fail_input, raising=False)
+
+    ok = svh.convert_path(target, dry_run=False, confirm=True)
+
+    assert ok is True
+
+
+def test_convert_path_confirm_not_asked_for_symlink(tmp_path, monkeypatch):
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real_dir)
+    monkeypatch.setattr(svh, "is_subvolume", lambda path: False)
+
+    def fail_input(prompt):
+        raise AssertionError("should not prompt for a symlink")
+
+    monkeypatch.setattr(svh, "input", fail_input, raising=False)
+
+    ok = svh.convert_path(link, dry_run=False, confirm=True)
+
+    assert ok is True
+
+
+def test_convert_path_confirm_not_asked_in_dry_run(tmp_path, monkeypatch):
+    target = tmp_path / "cache"
+    target.mkdir()
+    monkeypatch.setattr(svh, "is_subvolume", lambda path: False)
+
+    def fail_input(prompt):
+        raise AssertionError("dry-run should never prompt")
+
+    monkeypatch.setattr(svh, "input", fail_input, raising=False)
+
+    ok = svh.convert_path(target, dry_run=True, confirm=True)
+
+    assert ok is True
+
+
+def test_convert_path_confirm_asked_for_real_pending_conversion(tmp_path, monkeypatch, fake_btrfs_create):
+    target = tmp_path / "cache"
+    target.mkdir()
+    (target / "file.txt").write_text("data")
+    monkeypatch.setattr(svh, "is_subvolume", lambda path: False)
+    monkeypatch.setattr(svh, "copy_contents", lambda src, dst: None)
+    prompts = []
+
+    def fake_input(prompt):
+        prompts.append(prompt)
+        return "y"
+
+    monkeypatch.setattr(svh, "input", fake_input, raising=False)
+
+    ok = svh.convert_path(target, dry_run=False, confirm=True)
+
+    assert ok is True
+    assert len(prompts) == 1
+    assert str(target) in prompts[0]
+
+
+def test_convert_path_confirm_declined_skips_without_converting(tmp_path, monkeypatch):
+    target = tmp_path / "cache"
+    target.mkdir()
+    (target / "file.txt").write_text("data")
+    monkeypatch.setattr(svh, "is_subvolume", lambda path: False)
+    monkeypatch.setattr(svh, "input", lambda prompt: "n", raising=False)
+
+    def fail_run(cmd, **kwargs):
+        raise AssertionError("run() should not be called when the user declines")
+
+    monkeypatch.setattr(svh, "run", fail_run)
+
+    ok = svh.convert_path(target, dry_run=False, confirm=True)
+
+    assert ok is True
+    assert (target / "file.txt").read_text() == "data"
+
+
+def test_convert_path_no_confirm_by_default(tmp_path, monkeypatch, fake_btrfs_create):
+    """confirm defaults to False -- callers that don't ask for
+    confirmation (e.g. --yes) never see a prompt."""
+    target = tmp_path / "cache"
+    target.mkdir()
+    (target / "file.txt").write_text("data")
+    monkeypatch.setattr(svh, "is_subvolume", lambda path: False)
+    monkeypatch.setattr(svh, "copy_contents", lambda src, dst: None)
+
+    def fail_input(prompt):
+        raise AssertionError("should not prompt when confirm=False")
+
+    monkeypatch.setattr(svh, "input", fail_input, raising=False)
+
+    ok = svh.convert_path(target, dry_run=False)
+
+    assert ok is True
+
+
 def test_convert_path_rollback_on_copy_failure(tmp_path, monkeypatch):
     """If copy_contents() fails mid-conversion, original data must survive."""
     target = tmp_path / "cache"
@@ -377,6 +486,37 @@ def test_cmd_convert_converts_absolute_paths_entry_within_extra_root(tmp_path, m
     svh.cmd_convert(args)
 
     assert ["btrfs", "subvolume", "create", str(extra)] in fake_btrfs_create
+
+
+def test_cmd_convert_does_not_prompt_for_already_converted_target(tmp_path, monkeypatch, fake_btrfs_create):
+    """Regression test: without --yes, cmd_convert used to prompt
+    "Convert X?" before convert_path got a chance to notice the target
+    was already a subvolume (or a symlink, or missing, ...) -- asking
+    for a decision on something that was never going to change either
+    way. The prompt is now convert_path's own responsibility, asked only
+    once every no-op/skip condition has already been ruled out."""
+    monkeypatch.setattr(svh, "DEFAULT_VOLATILE_PATHS", [])
+    home = tmp_path / "alice"
+    home.mkdir()
+    good = home / "gooddir"
+    good.mkdir()
+
+    monkeypatch.setattr(svh.Path, "home", lambda: home)
+    monkeypatch.setattr(svh, "require_tool", lambda *a, **kw: None)
+    monkeypatch.setattr(svh, "get_fstype", lambda path: "btrfs")
+    monkeypatch.setattr(svh, "is_subvolume", lambda path: path == good)
+
+    def fail_input(prompt):
+        raise AssertionError("should not prompt for an already-converted target")
+
+    monkeypatch.setattr(svh, "input", fail_input, raising=False)
+
+    args = SimpleNamespace(
+        paths=["gooddir"], extra_roots=None, sys_paths=None,
+        config=tmp_path / "no-such-config.json", dry_run=False, yes=False,
+    )
+
+    svh.cmd_convert(args)  # must not raise (would, if it prompted)
 
 
 def test_cmd_convert_extra_roots_alone_is_never_a_target(tmp_path, monkeypatch, fake_btrfs_create):

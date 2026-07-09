@@ -788,8 +788,17 @@ def copy_contents(src: Path, dst: Path):
         raise RuntimeError(f"cp --reflink=always failed: {result.stderr.strip()}")
 
 
-def convert_path(path: Path, dry_run: bool) -> bool:
-    """Convert a single existing directory into a subvolume. Returns True on success/skip-ok."""
+def convert_path(path: Path, dry_run: bool, confirm: bool = False) -> bool:
+    """
+    Convert a single existing directory into a subvolume. Returns True
+    on success/skip-ok.
+
+    `confirm`, if set, prompts before the real conversion -- but only
+    once every skip condition above has already ruled out a no-op
+    (already a subvolume, a symlink, missing, a separate mount point,
+    ...). Asking "Convert X?" any earlier would prompt for paths that
+    were never going to be touched regardless of the answer.
+    """
     configure_logging()
     label = str(path)
 
@@ -828,6 +837,12 @@ def convert_path(path: Path, dry_run: bool) -> bool:
         paths_log.info("  would restore original ownership/permissions")
         paths_log.info("  would remove the backup directory")
         return True
+
+    if confirm:
+        answer = input(f"Convert {path}? [y/N] ").strip().lower()
+        if answer != "y":
+            paths_log.info(f"[skip]   {label} (user declined)")
+            return True
 
     backup = path.with_name(path.name + ".pre-subvol.bak")
     if backup.exists():
@@ -1131,13 +1146,7 @@ def cmd_convert(args) -> None:
         if not check_target_is_btrfs(path):
             continue
 
-        if not args.yes and not args.dry_run:
-            answer = input(f"Convert {path}? [y/N] ").strip().lower()
-            if answer != "y":
-                paths_log.info(f"[skip] {path} (user declined)")
-                continue
-
-        ok = convert_path(path, args.dry_run)
+        ok = convert_path(path, args.dry_run, confirm=not args.yes)
         (successes if ok else failures).append(str(path))
         paths_log.info("")
 
