@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.8", "3.10", "3.12", "3.13"]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -36,6 +36,75 @@ jobs:
       - name: Run tests
         run: pytest -v
 
+  # Exercises real btrfs/loop-mount/`cp --reflink` behavior with zero
+  # monkeypatching, on a throwaway loop-mounted filesystem -- the mocked
+  # `test` job above can't tell "the mock says X" from "btrfs actually
+  # does X" apart; see tasks/real-btrfs-ci-tests.plan.md and design.md's
+  # "Testing conventions" for the full rationale.
+  #
+  # Matrixed on OS, not Python version: this job tracks kernel/btrfs-progs/
+  # coreutils behavior, which varies far more by Ubuntu release than by
+  # interpreter version, so it deliberately uses each runner's own default
+  # python3 rather than pinning one (see the venv step below re: PEP 668).
+  #
+  # ubuntu-26.04 is a preview runner image (no Actions SLA yet, pre-GA) --
+  # continue-on-error keeps it visibly running on every push/PR without
+  # letting a GitHub-side image hiccup block merges/releases before it's
+  # earned that trust. Promote it once proven stable (or it reaches GA) by
+  # dropping the continue-on-error condition.
+  test-real-btrfs:
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.os == 'ubuntu-26.04' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["ubuntu-24.04", "ubuntu-26.04"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install (OS default python3, in a venv for PEP 668)
+        run: |
+          python3 -m venv .venv
+          source .venv/bin/activate
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          pip install -e '.[dev]'
+      - name: Install btrfs-progs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y btrfs-progs
+      - name: Create loop-mounted btrfs filesystem
+        run: |
+          truncate -s 2G disk.img
+          LOOP=$(sudo losetup --find --show disk.img)
+          echo "LOOP_DEV=$LOOP" >> "$GITHUB_ENV"
+          sudo mkfs.btrfs "$LOOP"
+          sudo mkdir -p /mnt/subvolumize-test
+          # user_subvol_rm_allowed: `btrfs subvolume delete` (used by
+          # convert_path's rollback path) needs CAP_SYS_ADMIN unless the
+          # filesystem is mounted with this option -- without it, an
+          # unprivileged user can create a subvolume but can't delete
+          # one, even their own. Since these tests deliberately run as
+          # the unprivileged runner user (matching real usage, see
+          # below), this is required for the rollback test to exercise
+          # the real delete path rather than fail on a mount-config gap
+          # that isn't what the test is about.
+          sudo mount -o user_subvol_rm_allowed "$LOOP" /mnt/subvolumize-test
+          # A real $HOME is itself normally a subvolume -- match that,
+          # and hand ownership to the actual (non-root) runner user,
+          # since this tool's whole design assumes a regular user, not
+          # root. btrfs subvolume create itself needs no root, only
+          # write permission on the parent dir -- only the loop/mount/
+          # mkfs setup above actually needs sudo.
+          sudo btrfs subvolume create /mnt/subvolumize-test/home
+          sudo chown -R "$(id -u):$(id -g)" /mnt/subvolumize-test/home
+          echo "SUBVOLUMIZE_TEST_HOME=/mnt/subvolumize-test/home" >> "$GITHUB_ENV"
+      - name: Run real-btrfs integration tests
+        run: pytest -v tests/test_integration_real_btrfs.py
+      - name: Unmount and detach loop device
+        if: always()
+        run: |
+          sudo umount /mnt/subvolumize-test || true
+          sudo losetup -d "$LOOP_DEV" || true
+
   release:
     # Attach the raw, standalone .py files to the GitHub Release as
     # downloadable assets -- no build/bundling step needed since both
@@ -43,7 +112,7 @@ jobs:
     # stable, versioned curl/wget URL per tag, e.g.:
     #   https://github.com/<owner>/<repo>/releases/latest/download/subvolumize_home.py
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [lint, test]
+    needs: [lint, test, test-real-btrfs]
     runs-on: ubuntu-latest
     permissions:
       contents: write

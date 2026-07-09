@@ -228,6 +228,126 @@ def test_convert_path_rollback_on_copy_failure(tmp_path, monkeypatch):
     assert not (target.parent / "cache.pre-subvol.bak").exists()
 
 
+def test_convert_path_rollback_removes_empty_subvolume_via_rmdir(tmp_path, monkeypatch):
+    """An empty (just-created) subvolume can be removed with a plain
+    rmdir -- no CAP_SYS_ADMIN or special mount option needed, unlike
+    `btrfs subvolume delete`. Rollback should prefer it and never shell
+    out to btrfs for this common case (copy_contents failing before
+    writing anything into the fresh subvolume)."""
+    target = tmp_path / "cache"
+    target.mkdir()
+    (target / "important.txt").write_text("don't lose me")
+
+    state = {"is_subvol": False}
+    monkeypatch.setattr(svh, "is_subvolume", lambda path: state["is_subvol"] and path == target)
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["btrfs", "subvolume", "create"]:
+            Path(cmd[3]).mkdir(parents=True, exist_ok=False)
+            state["is_subvol"] = True
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        raise AssertionError(f"unexpected command: {cmd} -- rmdir should have handled "
+                              f"an empty subvolume without shelling out to btrfs")
+
+    monkeypatch.setattr(svh, "run", fake_run)
+
+    def failing_copy(src, dst):
+        raise RuntimeError("simulated failure before writing anything")
+
+    monkeypatch.setattr(svh, "copy_contents", failing_copy)
+
+    ok = svh.convert_path(target, dry_run=False)
+
+    assert ok is False
+    assert target.is_dir()
+    assert (target / "important.txt").read_text() == "don't lose me"
+    assert not (target.parent / "cache.pre-subvol.bak").exists()
+
+
+def test_convert_path_rollback_falls_back_to_btrfs_delete_when_not_empty(tmp_path, monkeypatch):
+    """If something was already written into the fresh subvolume before
+    the failure, rmdir can't remove it (ENOTEMPTY) -- rollback must fall
+    back to the real `btrfs subvolume delete`."""
+    target = tmp_path / "cache"
+    target.mkdir()
+    (target / "important.txt").write_text("don't lose me")
+
+    state = {"is_subvol": False}
+    monkeypatch.setattr(svh, "is_subvolume", lambda path: state["is_subvol"] and path == target)
+    delete_calls = []
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["btrfs", "subvolume", "create"]:
+            Path(cmd[3]).mkdir(parents=True, exist_ok=False)
+            state["is_subvol"] = True
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[:3] == ["btrfs", "subvolume", "delete"]:
+            delete_calls.append(cmd)
+            shutil.rmtree(cmd[3], ignore_errors=True)
+            state["is_subvol"] = False
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(svh, "run", fake_run)
+
+    def failing_copy(src, dst):
+        # Simulate a partial copy: something lands in the fresh
+        # subvolume before the failure, so it's no longer empty.
+        (Path(dst) / "partial.txt").write_text("half-copied")
+        raise RuntimeError("simulated failure mid-copy")
+
+    monkeypatch.setattr(svh, "copy_contents", failing_copy)
+
+    ok = svh.convert_path(target, dry_run=False)
+
+    assert ok is False
+    assert len(delete_calls) == 1  # rmdir failed (not empty), fell back to the real delete
+    assert target.is_dir()
+    assert (target / "important.txt").read_text() == "don't lose me"
+    assert not (target.parent / "cache.pre-subvol.bak").exists()
+
+
+def test_convert_path_rollback_failure_returns_false_without_raising(tmp_path, monkeypatch, capsys):
+    """If even `btrfs subvolume delete` fails during rollback (e.g.
+    missing CAP_SYS_ADMIN and no user_subvol_rm_allowed), convert_path
+    must still return False cleanly rather than let the exception
+    escape -- and must clearly point at where the original data safely
+    is, since the automatic cleanup couldn't complete."""
+    target = tmp_path / "cache"
+    target.mkdir()
+    (target / "important.txt").write_text("don't lose me")
+
+    state = {"is_subvol": False}
+    monkeypatch.setattr(svh, "is_subvolume", lambda path: state["is_subvol"] and path == target)
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["btrfs", "subvolume", "create"]:
+            Path(cmd[3]).mkdir(parents=True, exist_ok=False)
+            state["is_subvol"] = True
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if cmd[:3] == ["btrfs", "subvolume", "delete"]:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="Operation not permitted")
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(svh, "run", fake_run)
+
+    def failing_copy(src, dst):
+        (Path(dst) / "partial.txt").write_text("half-copied")  # non-empty, so rmdir also fails
+        raise RuntimeError("simulated failure mid-copy")
+
+    monkeypatch.setattr(svh, "copy_contents", failing_copy)
+
+    ok = svh.convert_path(target, dry_run=False)
+
+    assert ok is False
+    backup = target.parent / "cache.pre-subvol.bak"
+    assert backup.exists()  # rollback couldn't complete -- original data stays safe at backup
+    assert (backup / "important.txt").read_text() == "don't lose me"
+    out = capsys.readouterr().out
+    assert "rollback failed" in out
+    assert str(backup) in out
+
+
 def test_cmd_convert_converts_absolute_paths_entry_within_extra_root(tmp_path, monkeypatch, fake_btrfs_create):
     """An absolute `paths` entry ($USER-validated) is converted directly
     as long as it resolves within a configured extra_roots boundary."""
@@ -1308,6 +1428,11 @@ def test_install_per_user_copies_self(tmp_path, monkeypatch):
 
 
 def test_install_global_requires_root(monkeypatch):
+    # require_tool mocked out: this test only cares that --global without
+    # root fails fast, regardless of what's actually on PATH (the real
+    # CI `test` job's runner doesn't have btrfs-progs installed -- only
+    # test-real-btrfs does).
+    monkeypatch.setattr(svh, "require_tool", lambda *a, **kw: None)
     monkeypatch.setattr(os, "geteuid", lambda: 1000)
     args = SimpleNamespace(global_install=True, service=False)
 
@@ -1342,6 +1467,10 @@ def test_install_without_service_does_not_require_systemctl(tmp_path, monkeypatc
 
 def test_install_per_user_service_writes_correct_unit(tmp_path, monkeypatch):
     monkeypatch.setattr(svh.Path, "home", lambda: tmp_path)
+    # Real PATH contents shouldn't matter for a mocked test -- the actual
+    # CI `test` job's runner doesn't have btrfs-progs installed (only
+    # test-real-btrfs does).
+    monkeypatch.setattr(svh.shutil, "which", lambda name: "/usr/bin/true")
     calls = []
 
     def fake_run(cmd, **kwargs):
@@ -1371,6 +1500,10 @@ def test_install_global_service_uses_absolute_exec_path(monkeypatch):
     real filesystem paths.
     """
     monkeypatch.setattr(os, "geteuid", lambda: 0)
+    # Real PATH contents shouldn't matter for a mocked test -- the actual
+    # CI `test` job's runner doesn't have btrfs-progs installed (only
+    # test-real-btrfs does).
+    monkeypatch.setattr(svh.shutil, "which", lambda name: "/usr/bin/true")
     calls = []
     written = {}
 

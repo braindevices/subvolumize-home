@@ -854,12 +854,42 @@ def convert_path(path: Path, dry_run: bool) -> bool:
     except Exception as exc:
         paths_log.error(f"  ERROR during conversion: {exc}")
         paths_log.info("  rolling back...")
-        # remove the (possibly partially populated) subvolume, if it was created
-        if is_subvolume(path):
-            run(["btrfs", "subvolume", "delete", str(path)])
-        elif path.exists():
-            shutil.rmtree(path)
-        os.rename(backup, path)
+        try:
+            # remove the (possibly partially populated) subvolume, if it was created
+            if is_subvolume(path):
+                try:
+                    # An *empty* subvolume can be removed with a plain
+                    # rmdir(2), same as an ordinary empty directory --
+                    # no CAP_SYS_ADMIN or special mount option needed.
+                    # This covers the common case (copy_contents failed
+                    # before writing anything into the fresh subvolume).
+                    os.rmdir(path)
+                except OSError:
+                    # Non-empty (a partial copy did write something) --
+                    # this needs the real btrfs ioctl, which does need
+                    # CAP_SYS_ADMIN unless the filesystem is mounted
+                    # with user_subvol_rm_allowed (see README).
+                    delete_result = run(["btrfs", "subvolume", "delete", str(path)])
+                    if delete_result.returncode != 0:
+                        raise RuntimeError(
+                            f"could not remove the partially-created subvolume: "
+                            f"{delete_result.stderr.strip()}"
+                        )
+            elif path.exists():
+                shutil.rmtree(path)
+            os.rename(backup, path)
+        except Exception as rollback_exc:
+            # Rollback itself failing must never raise out of this
+            # function (convert_path always returns a bool, never
+            # propagates an exception) -- and the one thing that matters
+            # most here is making sure whoever's reading the log knows
+            # exactly where their real data still safely is.
+            paths_log.error(
+                f"  ERROR: rollback failed ({rollback_exc}). Your original data is "
+                f"safe and untouched at {backup} -- do not delete it. {label} may be "
+                f"left in a broken/partial state; resolve manually before retrying."
+            )
+            return False
         paths_log.info(f"  rollback complete, {label} is unchanged")
         return False
 
@@ -887,6 +917,15 @@ def cmd_install(args) -> None:
     """Install this script (and optionally its systemd --user unit) so it
     runs automatically at login -- either for the current user only, or
     system-wide for every user (present and future) via --global."""
+    # Checked before the tool-requirement checks below: without root,
+    # --global can't do anything regardless of what's on PATH, so that's
+    # the more fundamental, cheaper-to-diagnose problem -- no point
+    # telling someone to go install btrfs-progs if they still need to
+    # re-run with sudo afterward anyway.
+    if args.global_install and os.geteuid() != 0:
+        sys.exit("error: --global requires root (sudo), since it writes to "
+                 "/usr/local/bin and /etc/systemd/user")
+
     # Fail before touching the filesystem: an install onto a machine
     # that's missing what cmd_convert actually needs at run time is
     # useless (or, for --service, silently broken on every future
@@ -906,9 +945,6 @@ def cmd_install(args) -> None:
     self_path = Path(__file__).resolve()
 
     if args.global_install:
-        if os.geteuid() != 0:
-            sys.exit("error: --global requires root (sudo), since it writes to "
-                     "/usr/local/bin and /etc/systemd/user")
         dest = Path("/usr/local/bin/subvolumize-home")
         unit_dir = Path("/etc/systemd/user")
         exec_path = str(dest)

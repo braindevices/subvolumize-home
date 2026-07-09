@@ -1,6 +1,6 @@
 # subvolumize-home
 
-Two small, dependency-free (stdlib only, Python 3.8+) tools for a
+Two small, dependency-free (stdlib only, Python 3.9+) tools for a
 specific btrfs workflow: keeping volatile/cache-like directories out of
 home-directory snapshots, while still preserving the handful of things
 inside them that are actually worth backing up (browser profiles,
@@ -34,6 +34,19 @@ your home directory.
 subvolumize-home --dry-run
 ```
 
+**If you run this as a regular (non-root) user** -- the intended,
+supported way -- rollback on failure needs your `$HOME` filesystem
+mounted with the `user_subvol_rm_allowed` option. `btrfs subvolume
+delete` (used only on the rollback path, if a conversion fails partway
+through) needs `CAP_SYS_ADMIN` otherwise, even to delete a subvolume
+you created yourself. Without it, a failed conversion still leaves your
+original data untouched and safe (nothing is ever deleted before the
+new subvolume is confirmed populated), but automatic cleanup of the
+partially-created subvolume won't succeed -- the error message tells
+you exactly where your data is and what to clean up by hand. Check with
+`findmnt -no OPTIONS /home` (or wherever your home filesystem is
+mounted); add the option in `/etc/fstab` if it's missing.
+
 ## Install
 
 Either tool works exactly the same way, dropped in raw with zero setup:
@@ -53,7 +66,7 @@ uv tool install subvolumize-home
 ```
 
 No dependencies beyond the Python standard library, no version
-requirement beyond Python 3.8+. `subvolumize-home` additionally needs
+requirement beyond Python 3.9+. `subvolumize-home` additionally needs
 Linux with `btrfs-progs` and a `cp` supporting `--reflink` (GNU
 coreutils >= 8.5, i.e. virtually any current distro). `findmnt`
 (util-linux) is used when present but not required -- filesystem type

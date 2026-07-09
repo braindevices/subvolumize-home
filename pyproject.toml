@@ -3,7 +3,7 @@ name = "subvolumize-home"
 version = "0.1.0"
 description = "Convert volatile home directories (caches, flatpak/snap data, build caches) into btrfs subvolumes so they're excluded from home-directory snapshots."
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [
     { name = "TODO: your name", email = "you@example.com" },
@@ -43,4 +43,4 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 110
-target-version = "py38"
+target-version = "py39"

@@ -51,6 +51,22 @@ unify their path-validation rules — the asymmetry is load-bearing.
   delete the backup. Any exception anywhere in that sequence triggers
   rollback (destroy the partial subvolume, rename the backup back). The
   backup is only ever removed after the copy has fully succeeded.
+- **Rollback tries `rmdir` before `btrfs subvolume delete`.** `btrfs
+  subvolume delete` needs `CAP_SYS_ADMIN` unless the filesystem is
+  mounted with `user_subvol_rm_allowed` — but an *empty* subvolume (the
+  common rollback case: the failure happened before `copy_contents`
+  wrote anything) can be removed with a plain `rmdir(2)`, exactly like
+  an ordinary empty directory, no special capability needed at all.
+  Rollback tries that first and only falls back to the real btrfs ioctl
+  if the subvolume turns out non-empty. If *that* also fails (missing
+  capability, no `user_subvol_rm_allowed`, or anything else), the
+  failure is caught and reported clearly rather than allowed to raise
+  out of `convert_path` — it always returns a bool, never propagates an
+  exception, and any rollback failure message says explicitly where the
+  original data safely still is (the untouched backup). Found via the
+  real-btrfs integration suite (see "Testing conventions" below):
+  mocking `run()` for `btrfs subvolume delete` meant nothing had ever
+  exercised what happens when that call itself fails.
 - **`is_subvolume`** uses the inode-256 heuristic (every btrfs subvolume
   root has that reserved inode number) specifically to avoid needing
   `CAP_SYS_ADMIN`/root for `btrfs subvolume show`.
@@ -215,11 +231,27 @@ empty — this tool does nothing until configured, unlike
 
 ## Testing conventions
 
-- Mock at the decision-logic boundary (`run`, `is_subvolume`,
-  `get_fstype`, `copy_contents`, `require_tool`), not real
-  `btrfs`/`findmnt`/`cp` calls — CI runners generally don't have a real
-  btrfs filesystem, and the goal is verifying this file's *logic*, not
-  the kernel's ioctl behavior.
+- **Two tiers, in two separate files.**
+  `tests/test_subvolumize_home.py` mocks at the decision-logic boundary
+  (`run`, `is_subvolume`, `get_fstype`, `copy_contents`,
+  `require_tool`) — fast, no root, runs everywhere, every Python
+  version. `tests/test_integration_real_btrfs.py` runs the real
+  `btrfs`/`cp`/`findmnt` commands against a real (CI: loop-mounted)
+  btrfs filesystem, skipped everywhere unless `SUBVOLUMIZE_TEST_HOME`
+  is set — it exists specifically for the things mocking can't verify
+  (does `cp -a --reflink=always -T` actually preserve hard links, does
+  the inode-256 heuristic hold on a real subvolume, does `/proc/mounts`
+  parsing work against the kernel's real format, does rollback actually
+  restore data after a real rename/subvolume-create). See
+  `tasks/real-btrfs-ci-tests.plan.md` for the full CI setup.
+- **A mocked test must never depend on what's actually installed.** The
+  `test` CI job's runner does *not* have `btrfs-progs` installed (only
+  `test-real-btrfs` does) — a mocked test that forgets to stub
+  `shutil.which`/`require_tool` and happens to pass locally (because
+  the dev machine has `btrfs`/`findmnt` on `PATH`) will fail in CI. This
+  bit real tests in this suite before being caught — verify by
+  temporarily hiding `btrfs`/`findmnt`/`cp` from `PATH` entirely and
+  re-running the mocked suite; it must still pass 100%.
 - **Logging is global, mutable, module-level state** (Python's `logging`
   registry is a singleton keyed by name) — an autouse fixture
   (`_reset_audit_logging`) must clear both loggers' handlers *and*
